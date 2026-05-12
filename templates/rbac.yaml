@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "luks-trim.serviceAccountName" . }}
+  namespace: {{ include "luks-trim.namespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+# ClusterRole: read individual PersistentVolumes so the trim script can resolve
+# a Longhorn device name (= PV name) to the PVC namespace/name, which is then
+# used to look up the LUKS passphrase secret in the correct namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-pv-reader
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-pv-reader
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "luks-trim.fullname" . }}-pv-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" . }}
+    namespace: {{ include "luks-trim.namespace" . }}
+---
+# ClusterRole: list nodes so the coordinator can enumerate them to create
+# per-node Jobs. List (not get) is sufficient and minimal.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-node-reader
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-node-reader
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "luks-trim.fullname" . }}-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" . }}
+    namespace: {{ include "luks-trim.namespace" . }}
+---
+# Role: coordinator creates one Job per node, then optionally deletes stale
+# Jobs from previous runs. Scoped to the chart namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-job-manager
+  namespace: {{ include "luks-trim.namespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-job-manager
+  namespace: {{ include "luks-trim.namespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "luks-trim.fullname" . }}-job-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" . }}
+    namespace: {{ include "luks-trim.namespace" . }}
+
+{{- if and .Values.longhorn.enabled .Values.longhorn.globalKey.enabled }}
+---
+# Role: read the global LUKS key secret.
+# Created in the namespace where the secret lives (may differ from chart namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-global-key-reader
+  namespace: {{ include "luks-trim.globalKeyNamespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.longhorn.globalKey.secretName | quote }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-global-key-reader
+  namespace: {{ include "luks-trim.globalKeyNamespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "luks-trim.fullname" . }}-global-key-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" . }}
+    namespace: {{ include "luks-trim.namespace" . }}
+{{- end }}
+
+{{- if and .Values.longhorn.enabled .Values.longhorn.namespaceSecrets }}
+{{- range .Values.longhorn.namespaceSecrets }}
+---
+# Role: read LUKS key secrets in namespace {{ .namespace }}.
+# Covers both namespace-shared keys and per-PVC secrets listed under secretNames.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "luks-trim.fullname" $ }}-ns-key-{{ .namespace | trunc 20 | trimSuffix "-" }}
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "luks-trim.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- range .secretNames }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" $ }}-ns-key-{{ .namespace | trunc 20 | trimSuffix "-" }}
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "luks-trim.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "luks-trim.fullname" $ }}-ns-key-{{ .namespace | trunc 20 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" $ }}
+    namespace: {{ include "luks-trim.namespace" $ }}
+{{- end }}
+{{- end }}

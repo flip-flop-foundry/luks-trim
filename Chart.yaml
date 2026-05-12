@@ -1,0 +1,25 @@
+apiVersion: v2
+name: luks-trim
+description: >
+  Scheduled LUKS allow-discards enablement and fstrim for Talos system volumes,
+  plus allow-discards enablement for Longhorn encrypted volumes.
+  Runs a weekly CronJob that spawns a short-lived privileged Job on every
+  selected node, then exits cleanly.
+
+  NOTE: fstrim for Longhorn encrypted volumes is NOT performed by this chart.
+  Longhorn handles TRIM via its own RecurringJob ("Trim Filesystem"). This chart
+  enables the allow-discards flag on the underlying dm-crypt device so that
+  Longhorn's own trim job can propagate discards through the encryption layer.
+  You must create and schedule a Longhorn RecurringJob of type "filesystem-trim"
+  separately.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - luks
+  - fstrim
+  - longhorn
+  - talos
+  - storage
+maintainers:
+  - name: cluster-admin

@@ -1,0 +1,263 @@
+# =============================================================================
+# luks-trim Helm chart — values reference
+# =============================================================================
+# Architecture summary:
+#   A CronJob (coordinator) runs on schedule. It lists the cluster nodes,
+#   filters them according to nodeLabelSelector and excludedNodes, then
+#   creates one short-lived Job per selected node. Each Job runs trim.sh
+#   from a ConfigMap, enables LUKS allow-discards, runs fstrim, and exits.
+#   Jobs self-delete ttlSecondsAfterFinished.worker seconds after completion.
+# =============================================================================
+
+# Namespace for all chart resources: ServiceAccount, ConfigMap, CronJob, and
+# the per-node Jobs spawned at runtime. Cross-namespace Roles (for secrets in
+# other namespaces) are created in the namespace where the secrets live, but
+# they bind back to the ServiceAccount in THIS namespace.
+namespace: luks-trim
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+# Both the coordinator and the per-node worker Jobs use this image.
+# The default points to the custom Ubuntu-based image built by the GitHub Actions
+# workflow (.github/workflows/build-image.yml). It includes all required tools
+# (cryptsetup, dmsetup, fstrim, jq, curl, grpcurl) with pinned versions and
+# checksum verification — no runtime downloads occur.
+#
+# For production use, pin to a date-stamped or SHA tag instead of 'latest':
+#   tag: "20260512"           # date-stamped build
+#   tag: "sha-abc1234"        # git-sha build
+#
+image:
+  repository: ghcr.io/flip-flop-foundry/luks-trim/worker
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# - name: my-registry-secret
+
+# ---------------------------------------------------------------------------
+# ServiceAccount
+# ---------------------------------------------------------------------------
+serviceAccount:
+  # Name of the ServiceAccount created by this chart.
+  name: luks-trim
+  # Annotations added to the ServiceAccount. Useful for workload identity
+  # (e.g. AWS IRSA, GKE Workload Identity) if the KMS endpoint requires cloud
+  # credentials rather than TLS certificates.
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Dry-run mode
+# ---------------------------------------------------------------------------
+# When true, the worker script verifies configuration end-to-end but does NOT
+# write any changes to disks or LUKS headers:
+#
+#   Longhorn path:
+#     - LUKS key secrets are fetched from Kubernetes (real API calls).
+#     - Key validity is verified via cryptsetup open --test-passphrase
+#       (read-only; does not map or modify the device).
+#     - cryptsetup refresh (allow-discards) is skipped.
+#     - fstrim is skipped entirely (no FITRIM ioctl).
+#
+#   Talos path:
+#     - The KMS Unseal RPC IS called for real. This verifies KMS connectivity
+#       and that the node UUID resolves to the correct key. The KMS server
+#       will log this as a real Unseal event.
+#     - The returned key is verified via cryptsetup open --test-passphrase
+#       (read-only).
+#     - cryptsetup refresh (allow-discards) is skipped.
+#     - fstrim -n is run (kernel walks free-space tree; no FITRIM ioctl issued).
+#
+# Useful for verifying key configuration and KMS connectivity before the
+# first live run, or after infrastructure changes.
+dryRun: false
+
+# ---------------------------------------------------------------------------
+# Schedule
+# ---------------------------------------------------------------------------
+# Standard cron expression for when the coordinator runs.
+# Default: weekly on Sunday at 02:00 UTC.
+schedule: "0 2 * * 0"
+
+# IANA timezone for the schedule. Requires Kubernetes >= 1.27 (GA in 1.27).
+# Examples: "UTC", "Europe/Copenhagen", "America/New_York"
+timezone: "UTC"
+
+# ---------------------------------------------------------------------------
+# Longhorn encrypted volume processing
+# ---------------------------------------------------------------------------
+longhorn:
+  enabled: true
+
+  # Path under which Longhorn exposes active volume devices on each node.
+  # Change only if you have a non-standard Longhorn installation.
+  devicePath: /dev/longhorn
+
+  # -- Global LUKS key --
+  # A single secret that unlocks all encrypted Longhorn volumes cluster-wide.
+  # This is the simplest setup: one secret, one key, all volumes.
+  #
+  # Key lookup order per device (first match wins):
+  #   1. globalKey  (if enabled)
+  #   2. per-PVC secret in the PVC's namespace (named after the PVC itself)
+  #   3. namespace shared key from namespaceSecrets entries
+  globalKey:
+    enabled: false
+    # Name of the Kubernetes Secret containing the LUKS passphrase.
+    secretName: ""
+    # Namespace where that secret lives. Defaults to .Values.namespace if empty.
+    # A Role + RoleBinding will be created in this namespace to grant the
+    # ServiceAccount read access to the named secret.
+    secretNamespace: ""
+    # Key within secret.data that holds the base64-encoded LUKS passphrase.
+    # Longhorn's own crypto integration uses CRYPTO_KEY_VALUE.
+    secretKey: CRYPTO_KEY_VALUE
+
+  # -- Per-namespace secrets --
+  # List of namespaces that contain encrypted Longhorn volumes, with the
+  # secret names the trim script is allowed to read in each namespace.
+  #
+  # For every entry, the chart creates a Role + RoleBinding in that namespace
+  # granting GET on the listed secrets to the luks-trim ServiceAccount.
+  #
+  # Runtime key lookup (steps 2 and 3 above):
+  #   Step 2: the script tries a secret named after the PVC (dynamic name).
+  #           To allow this, add the PVC's name to secretNames.
+  #   Step 3: the script tries each name listed under secretNames in order
+  #           until one unlocks the device.
+  #
+  # Secrets listed here that do not exist yet are handled gracefully at
+  # runtime (HTTP 404 is logged as a warning, not a fatal error).
+  #
+  # To add a namespace, append an entry following the example below.
+  namespaceSecrets: []
+  # - namespace: gitea
+  #   secretNames:
+  #     - luks-ns-shared-key      # namespace-wide shared key (step 3)
+  #     - gitea-shared-storage    # per-PVC secret (step 2, PVC named gitea-shared-storage)
+
+# ---------------------------------------------------------------------------
+# Talos system volume processing
+# ---------------------------------------------------------------------------
+talos:
+  enabled: true
+
+  # gRPC endpoint of the Talos KMS server used to unseal LUKS2 volume keys.
+  # Required when talos.enabled is true.
+  # Format: https://<host>:<port>  (scheme is required; stripped internally)
+  kmsEndpoint: ""
+  # Example: kmsEndpoint: "https://kms.example.com:50051"
+
+# ---------------------------------------------------------------------------
+# grpcurl — embedded in the custom worker image; no runtime download.
+# ---------------------------------------------------------------------------
+# grpcurl is baked into the worker image at build time with checksum
+# verification (see Dockerfile). The version below is informational only
+# and is used as an ARG during the Docker build via the GitHub Actions workflow.
+# To upgrade grpcurl, bump this value and re-run the build workflow.
+grpcurl:
+  version: "1.9.3"
+
+# ---------------------------------------------------------------------------
+# Node selection — nodeLabelSelector vs excludedNodes
+# ---------------------------------------------------------------------------
+#
+# These two settings filter which nodes receive a per-node trim Job.
+# They operate at different levels and compose cleanly:
+#
+#   nodeLabelSelector  — allowlist, evaluated by the Kubernetes API server
+#   ─────────────────
+#   A label selector string passed as ?labelSelector=... when the coordinator
+#   GETs /api/v1/nodes. Only nodes whose labels match are returned — the API
+#   server does the filtering, so non-matching nodes are never even seen by
+#   the coordinator.
+#
+#   Use this to target nodes by ROLE or arbitrary label, e.g.:
+#     "!node-role.kubernetes.io/control-plane"        — workers only
+#     "kubernetes.io/os=linux,storage=nvme"           — label-selected subset
+#     "node-role.kubernetes.io/worker"                — explicit worker role
+#
+#   Empty string (default) = no label filter = all nodes returned.
+#
+#   excludedNodes  — denylist, evaluated by the coordinator after listing
+#   ─────────────
+#   A list of exact node names to skip even if they passed the label filter.
+#   Use this for one-off exceptions: a node under maintenance, a node whose
+#   disks are known not to support TRIM, or a node you want to exclude
+#   temporarily without changing its labels.
+#
+#   How they compose:
+#     Effective node set = (nodes matching nodeLabelSelector)
+#                          MINUS (nodes in excludedNodes)
+#
+#   Example — workers only, except one node being replaced:
+#     nodeLabelSelector: "!node-role.kubernetes.io/control-plane"
+#     excludedNodes:
+#       - worker-03.example.com
+#
+#   Why not just one setting?
+#     nodeLabelSelector is structural (permanent topology).
+#     excludedNodes is operational (temporary exceptions).
+#     Mixing them into one field would require re-labelling nodes for
+#     temporary exclusions, which is more disruptive.
+#
+nodeLabelSelector: ""
+# Example: "!node-role.kubernetes.io/control-plane"
+
+excludedNodes: []
+# - node-name-to-skip.example.com
+
+# ---------------------------------------------------------------------------
+# TTL for coordinator and worker Jobs after completion
+# ---------------------------------------------------------------------------
+ttlSecondsAfterFinished:
+  # Coordinator Job (the CronJob's own pod). Short: it only submits Jobs.
+  coordinator: 120
+  # Per-node worker Jobs. Keep long enough for your log aggregator to scrape
+  # the pod logs before the pod and its log stream are deleted. If you use
+  # Loki, Fluentd, or a similar tool, ensure this exceeds the scrape interval.
+  # Default: 3600 (1 hour).
+  worker: 3600
+
+# ---------------------------------------------------------------------------
+# Resource requests/limits
+# ---------------------------------------------------------------------------
+# coordinator — lightweight pod that only calls the K8s API to submit Jobs.
+coordinatorResources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi
+
+# workerResources — injected into each per-node Job. fstrim is I/O-intensive;
+# CPU/memory limits are modest but preventing unbounded I/O competition with
+# production workloads requires a storage QoS policy outside this chart.
+# Set to {} to remove all limits (not recommended on shared nodes).
+workerResources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+#   limits:
+#     memory: 128Mi
+
+# ---------------------------------------------------------------------------
+# Tolerations for the per-node worker Jobs
+# ---------------------------------------------------------------------------
+# Default tolerates all taints so that Jobs land on control-plane nodes too.
+# Tighten if you use nodeLabelSelector to exclude control-plane nodes.
+tolerations:
+  - operator: Exists
+
+# ---------------------------------------------------------------------------
+# Pod annotations (applied to both coordinator and worker pods)
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+# podAnnotations:
+#   prometheus.io/scrape: "false"
+#   vault.hashicorp.com/agent-inject: "false"

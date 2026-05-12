@@ -1,0 +1,342 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-script
+  namespace: {{ include "luks-trim.namespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+data:
+  trim.sh: |
+    #!/bin/sh
+    # luks-trim worker script — run once per node, then exit.
+    # Env vars injected by the per-node Job spec:
+    #   LONGHORN_ENABLED      "true" | "false"
+    #   TALOS_ENABLED         "true" | "false"
+    #   KMS_ENDPOINT          https://<host>:<port>
+    #   GLOBAL_KEY_ENABLED    "true" | "false"
+    #   GLOBAL_KEY_NS         namespace of the global key secret
+    #   GLOBAL_KEY_SECRET     name of the global key secret
+    #   GLOBAL_KEY_FIELD      data field name inside the secret
+    #   DRY_RUN               "true" | "false" — skip all writes when true
+    #
+    # All required tools (cryptsetup, dmsetup, fstrim, jq, curl, grpcurl) are
+    # pre-installed in the custom Ubuntu worker image built by the GitHub Actions
+    # workflow (.github/workflows/build-image.yml). No runtime package downloads.
+
+    {{- if .Values.talos.enabled }}
+    # Write the KMS proto definition used by grpcurl for Talos KMS unseal calls.
+    printf '%s\n' \
+      'syntax = "proto3";' \
+      'package sidero.kms;' \
+      'service KMSService {' \
+      '  rpc Seal(Request) returns (Response);' \
+      '  rpc Unseal(Request) returns (Response);' \
+      '}' \
+      'message Request { string node_uuid = 1; bytes data = 2; }' \
+      'message Response { bytes data = 1; }' \
+      > /tmp/kms.proto
+    {{- end }}
+
+    KUBE_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    KUBE_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    KUBE_API=https://kubernetes.default.svc
+
+    # ── Shared helpers ──────────────────────────────────────────────────────
+
+    # fetch_secret_key <namespace> <secret-name> <field-name>
+    # Prints the base64-encoded value of the requested field from a K8s secret.
+    fetch_secret_key() {
+      _ns="$1"; _secret="$2"; _field="$3"
+      _response=$(curl -s -w "\n%{http_code}" --cacert "$KUBE_CA" \
+        -H "Authorization: Bearer $KUBE_TOKEN" \
+        "$KUBE_API/api/v1/namespaces/$_ns/secrets/$_secret" 2>/dev/null)
+      _http_code=$(printf '%s' "$_response" | awk 'END{print}')
+      _body=$(printf '%s' "$_response" | awk 'NR>1{print prev} {prev=$0}')
+      case "$_http_code" in
+        200) printf '%s' "$_body" | jq -r --arg f "$_field" '.data[$f] // empty' ;;
+        404) echo "    [warn] secret $_ns/$_secret not found" >&2 ;;
+        403) echo "    [warn] secret $_ns/$_secret: permission denied" >&2 ;;
+        '')  echo "    [warn] secret $_ns/$_secret: no response from API" >&2 ;;
+        *)   echo "    [warn] secret $_ns/$_secret: HTTP $_http_code" >&2 ;;
+      esac
+    }
+
+    # lookup_pvc <pv-name>  →  "namespace/pvcname"
+    lookup_pvc() {
+      _pv="$1"
+      _pv_json=$(curl -sf --cacert "$KUBE_CA" \
+        -H "Authorization: Bearer $KUBE_TOKEN" \
+        "$KUBE_API/api/v1/persistentvolumes/$_pv" 2>/dev/null)
+      [ -z "$_pv_json" ] && return
+      _pvc_ns=$(printf '%s' "$_pv_json" | jq -r '.spec.claimRef.namespace // empty')
+      _pvc_name=$(printf '%s' "$_pv_json" | jq -r '.spec.claimRef.name // empty')
+      [ -n "$_pvc_ns" ] && [ -n "$_pvc_name" ] && echo "$_pvc_ns/$_pvc_name"
+    }
+
+    # try_key <device> <dm-name> <key_b64> <label>
+    # key_b64: base64-encoded passphrase (decoded to a tempfile before use).
+    # Reads existing LUKS flags and preserves them while adding allow-discards.
+    # In dry-run mode the key is verified but cryptsetup refresh is skipped.
+    try_key() {
+      _dev="$1"; _name="$2"; _key_b64="$3"; _label="$4"
+      [ -z "$_key_b64" ] && return 1
+      _tmpkey=$(mktemp)
+      printf '%s' "$_key_b64" | base64 -d > "$_tmpkey"
+      _flags=$(cryptsetup luksDump "$_dev" 2>/dev/null \
+        | grep "^Flags:" | sed 's/Flags:[[:space:]]*//')
+      if printf '%s' "$_flags" | grep -q "allow-discards"; then
+        echo "    $_label: allow-discards already persistent"
+        rm -f "$_tmpkey"; return 0
+      fi
+      _extra="--allow-discards"
+      printf '%s' "$_flags" | grep -q "no-read-workqueue"  && _extra="$_extra --perf-no_read_workqueue"
+      printf '%s' "$_flags" | grep -q "no-write-workqueue" && _extra="$_extra --perf-no_write_workqueue"
+      if [ "${DRY_RUN:-false}" = "true" ]; then
+        # Verify the key unlocks the device without writing anything.
+        if cryptsetup open --test-passphrase --key-file "$_tmpkey" "$_dev" 2>/dev/null; then
+          echo "    $_label: [dry-run] key valid — would apply allow-discards (flags: $_extra --persistent)"
+          rm -f "$_tmpkey"; return 0
+        else
+          echo "    $_label: [dry-run] key did NOT unlock device"
+          rm -f "$_tmpkey"; return 1
+        fi
+      fi
+      if cryptsetup $_extra --persistent --key-file "$_tmpkey" refresh "$_name" 2>/dev/null; then
+        echo "    $_label: applied allow-discards"
+        rm -f "$_tmpkey"; return 0
+      fi
+      rm -f "$_tmpkey"; return 1
+    }
+
+    # fstrim_dev <dm-name>
+    # Resolves the dm-crypt device to its mountpoint via the host mount table
+    # (accessible because hostPID=true exposes /proc/1/mounts) and runs fstrim
+    # in the host mount namespace via nsenter.
+    # Ubuntu's fstrim produces richer output than Alpine's (bytes freed, time),
+    # which is why the worker image is Ubuntu-based.
+    # In dry-run mode the mountpoint is identified but fstrim is not executed.
+    fstrim_dev() {
+      _dm="$1"
+      _real=$(readlink -f "/dev/mapper/$_dm" 2>/dev/null)
+      _mp=$(awk -v d1="$_real" -v d2="/dev/mapper/$_dm" \
+        '$1==d1 || $1==d2 {print $2; exit}' /proc/1/mounts 2>/dev/null)
+      if [ -z "$_mp" ]; then
+        _sectors=$(cat "/sys/class/block/$(basename "$_real")/size" 2>/dev/null || echo 0)
+        _mib=$(( _sectors / 2048 ))
+        if [ "$_mib" -lt 1024 ]; then
+          echo "    [fstrim] $_dm ($_real): small system partition (~${_mib} MiB), skipping"
+        else
+          echo "    [fstrim] $_dm ($_real): not found in mount table (block volume?), skipping"
+        fi
+        return 0
+      fi
+      echo "    [fstrim] $_dm ($_real) mounted at $_mp"
+      if [ "${DRY_RUN:-false}" = "true" ]; then
+        # fstrim -n (--dry-run) does everything except issue the FITRIM ioctl —
+        # it walks the filesystem free-space tree and reports what would be
+        # discarded without touching the device.
+        _out=$(nsenter --mount=/proc/1/ns/mnt -- fstrim -n -v "$_mp" 2>&1)
+        _rc=$?
+        printf '%s\n' "$_out" | sed 's/^/    [dry-run] /'
+        [ "$_rc" -eq 0 ] || echo "    [fstrim] [dry-run] fstrim -n exited $_rc"
+        return 0
+      fi
+      _out=$(nsenter --mount=/proc/1/ns/mnt -- fstrim -v "$_mp" 2>&1)
+      _rc=$?
+      printf '%s\n' "$_out" | sed 's/^/    /'
+      [ "$_rc" -eq 0 ] || echo "    [fstrim] [warn] fstrim exited $_rc"
+    }
+
+    {{- if .Values.longhorn.enabled }}
+    # ── Longhorn volume processor ────────────────────────────────────────────
+    # This processor enables LUKS allow-discards on Longhorn encrypted volumes
+    # so that discard/TRIM requests from the filesystem are passed through the
+    # dm-crypt layer to the underlying storage.
+    #
+    # NOTE — fstrim is NOT run here. Longhorn itself handles periodic TRIM via
+    # its own "Trim Filesystem" job. You must create and schedule that job
+    # separately in the Longhorn UI or via a RecurringJob resource. Once
+    # allow-discards is enabled by this chart, Longhorn's trim job will work
+    # correctly through the encrypted device.
+    process_longhorn_volumes() {
+      echo "--- Checking Longhorn encrypted volumes..."
+      _dev_path="${LONGHORN_DEVICE_PATH:-/dev/longhorn}"
+      if [ ! -d "$_dev_path" ] || [ -z "$(ls "$_dev_path"/ 2>/dev/null)" ]; then
+        echo "  No volumes in $_dev_path on this node"; return
+      fi
+
+      _global_key=""
+      if [ "${GLOBAL_KEY_ENABLED:-false}" = "true" ]; then
+        _global_key=$(fetch_secret_key "$GLOBAL_KEY_NS" "$GLOBAL_KEY_SECRET" "$GLOBAL_KEY_FIELD")
+      fi
+
+      _failed=0
+      for _dev in "$_dev_path"/*; do
+        [ -e "$_dev" ] || continue
+        _name=$(basename "$_dev")
+        if dmsetup table "$_name" 2>/dev/null | grep -q "allow_discards"; then
+          echo "  $_name: allow_discards already active, skipping"; continue
+        fi
+        _pvc_info=$(lookup_pvc "$_name")
+        if [ -n "$_pvc_info" ]; then
+          _pvc_ns="${_pvc_info%%/*}"; _pvc_name="${_pvc_info##*/}"
+          echo "  $_name: PVC $_pvc_ns/$_pvc_name — trying keys..."
+        else
+          echo "  $_name: could not resolve PVC, trying global key only..."
+          _pvc_ns=""; _pvc_name=""
+        fi
+        _applied=""
+        # 1. Global key
+        if [ -n "$_global_key" ]; then
+          try_key "$_dev" "$_name" "$_global_key" "$GLOBAL_KEY_NS/$GLOBAL_KEY_SECRET" \
+            && _applied="$GLOBAL_KEY_NS/$GLOBAL_KEY_SECRET"
+        fi
+        # 2. Per-PVC secret (secret named after the PVC, field CRYPTO_KEY_VALUE)
+        if [ -z "$_applied" ] && [ -n "$_pvc_ns" ] && [ -n "$_pvc_name" ]; then
+          _pvc_key=$(fetch_secret_key "$_pvc_ns" "$_pvc_name" "CRYPTO_KEY_VALUE")
+          try_key "$_dev" "$_name" "$_pvc_key" "$_pvc_ns/$_pvc_name" \
+            && _applied="$_pvc_ns/$_pvc_name"
+        fi
+        # 3. Namespace shared secrets — iterate through every secret name listed
+        #    under longhorn.namespaceSecrets for this PVC's namespace. The list
+        #    is baked in at render time so no runtime config is needed.
+        {{- if .Values.longhorn.namespaceSecrets }}
+        if [ -z "$_applied" ] && [ -n "$_pvc_ns" ]; then
+          {{- range .Values.longhorn.namespaceSecrets }}
+          if [ -z "$_applied" ] && [ "{{ .namespace }}" = "$_pvc_ns" ]; then
+            {{- range .secretNames }}
+            if [ -z "$_applied" ]; then
+              _ns_key=$(fetch_secret_key "$_pvc_ns" {{ . | quote }} "CRYPTO_KEY_VALUE")
+              try_key "$_dev" "$_name" "$_ns_key" "$_pvc_ns/{{ . }}" \
+                && _applied="$_pvc_ns/{{ . }}"
+            fi
+            {{- end }}
+          fi
+          {{- end }}
+        fi
+        {{- end }}
+        if [ -n "$_applied" ]; then
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "  $_name: [dry-run] key valid — allow-discards would be applied (key: $_applied)"
+          else
+            echo "  $_name: allow-discards enabled (key: $_applied)"
+          fi
+        else
+          echo "  [ERROR] $_name: no matching key found — allow-discards NOT enabled"
+          _failed=$(( _failed + 1 ))
+        fi
+      done
+      if [ "$_failed" -gt 0 ]; then
+        echo "  [ERROR] $_failed Longhorn volume(s) could not be unlocked. Check key configuration."
+      fi
+    }
+    {{- end }}
+
+    {{- if .Values.talos.enabled }}
+    # ── Talos LUKS volume processor ──────────────────────────────────────────
+    # Volumes appear as /dev/mapper/luks2-<partition-uuid>.
+    # LUKS2 headers contain a sideroKMS token with UserData.sealedData.
+    # Flow: read sealedData → KMS Unseal(nodeUUID, sealedData) → passphrase.
+    process_talos_volumes() {
+      echo "--- Checking Talos LUKS volumes..."
+      _node_uuid=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      if [ -z "$_node_uuid" ]; then
+        echo "  [ERROR] cannot read node UUID from /sys/class/dmi/id/product_uuid — skipping Talos volumes"
+        return 1
+      fi
+      _kms_host=$(printf '%s' "$KMS_ENDPOINT" | sed 's|^https://||')
+      _found=false
+      _failed=0
+      for _mp in /dev/mapper/luks2-*; do
+        [ -e "$_mp" ] || continue
+        _found=true
+        _dm=$(basename "$_mp")
+        echo "  $_dm:"
+        _discard_ok=false
+        if dmsetup table "$_dm" 2>/dev/null | grep -q "allow_discards"; then
+          echo "    allow_discards already active"; _discard_ok=true
+        fi
+        if ! $_discard_ok; then
+          _backing=$(cryptsetup status "$_dm" 2>/dev/null | awk '/[[:space:]]device:/{print $2}')
+          if [ -z "$_backing" ]; then
+            echo "    [ERROR] cannot determine backing device for $_dm"
+            _failed=$(( _failed + 1 ))
+            continue
+          fi
+          echo "    backing: $_backing"
+          # Scan all 32 LUKS2 token slots (0–31) until we find the sideroKMS token.
+          # Other tools (e.g. systemd-cryptsetup) may occupy low-numbered slots,
+          # pushing the sideroKMS token beyond the previously hard-coded range of 0–7.
+          _sealed=""
+          _tid=0
+          while [ "$_tid" -le 31 ]; do
+            _tj=$(cryptsetup token export --token-id "$_tid" "$_backing" 2>/dev/null)
+            if [ $? -eq 0 ] && [ -n "$_tj" ]; then
+              _type=$(printf '%s' "$_tj" | jq -r '.type // empty' 2>/dev/null)
+              if [ "$_type" = "sideroKMS" ]; then
+                _sealed=$(printf '%s' "$_tj" \
+                  | jq -r '.UserData.sealedData // .userData.sealedData // .sealedData // empty')
+                [ -n "$_sealed" ] && break
+              fi
+            fi
+            _tid=$(( _tid + 1 ))
+          done
+          if [ -z "$_sealed" ]; then
+            echo "    [ERROR] no sideroKMS token found in LUKS2 header of $_backing (scanned slots 0–31)"
+            _failed=$(( _failed + 1 ))
+            continue
+          fi
+          # Build the KMS request using jq to guarantee valid JSON regardless of
+          # special characters in _sealed or _node_uuid.
+          _req=$(jq -n \
+            --arg uuid "$_node_uuid" \
+            --arg data "$_sealed" \
+            '{"node_uuid": $uuid, "data": $data}')
+          _resp=$(grpcurl \
+            -cacert /etc/ssl/certs/ca-certificates.crt \
+            -import-path /tmp -proto kms.proto \
+            -d "$_req" \
+            "$_kms_host" sidero.kms.KMSService/Unseal 2>/dev/null)
+          if [ -z "$_resp" ]; then
+            echo "    [ERROR] KMS unseal failed for $_dm — verbose output:"
+            grpcurl -v -cacert /etc/ssl/certs/ca-certificates.crt \
+              -import-path /tmp -proto kms.proto -d "$_req" \
+              "$_kms_host" sidero.kms.KMSService/Unseal
+            _failed=$(( _failed + 1 ))
+            continue
+          fi
+          _pass=$(printf '%s' "$_resp" | jq -r '.data // empty')
+          if [ -z "$_pass" ]; then
+            echo "    [ERROR] KMS returned empty passphrase for $_dm"
+            _failed=$(( _failed + 1 ))
+            continue
+          fi
+          _key_b64=$(printf '%s' "$_pass" | base64 | tr -d '\n')
+          if try_key "$_backing" "$_dm" "$_key_b64" "talos-kms"; then
+            _discard_ok=true
+          else
+            echo "    [ERROR] cryptsetup refresh failed for $_dm"
+            _failed=$(( _failed + 1 ))
+          fi
+        fi
+        $_discard_ok && fstrim_dev "$_dm"
+      done
+      $_found || echo "  No /dev/mapper/luks2-* devices on this node"
+      if [ "$_failed" -gt 0 ]; then
+        echo "  [ERROR] $_failed Talos volume(s) failed. Check KMS connectivity and LUKS2 headers."
+      fi
+    }
+    {{- end }}
+
+    # ── Main ─────────────────────────────────────────────────────────────────
+    echo "$(date) - luks-trim starting on $(cat /proc/sys/kernel/hostname)"
+    echo "  longhorn=${LONGHORN_ENABLED} talos=${TALOS_ENABLED} dry_run=${DRY_RUN:-false}"
+    _exit=0
+    [ "${LONGHORN_ENABLED:-false}" = "true" ] && { process_longhorn_volumes || _exit=1; }
+    [ "${TALOS_ENABLED:-false}"   = "true" ] && { process_talos_volumes    || _exit=1; }
+    if [ "$_exit" -ne 0 ]; then
+      echo "$(date) - Done with ERRORS (exit $_exit) — review [ERROR] lines above."
+    else
+      echo "$(date) - Done."
+    fi
+    exit "$_exit"

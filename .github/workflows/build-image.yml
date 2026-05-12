@@ -1,0 +1,89 @@
+name: Build and push worker image
+
+on:
+  # Rebuild every Monday at 03:00 UTC so the Ubuntu base and package versions
+  # stay current without manual intervention.
+  schedule:
+    - cron: "0 3 * * 1"
+
+  # Rebuild on any change to the Dockerfile or this workflow.
+  push:
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/build-image.yml"
+    branches:
+      - main
+
+  # Allow a manual trigger from the Actions UI (useful for testing or urgent
+  # base-image refreshes).
+  workflow_dispatch:
+    inputs:
+      grpcurl_version:
+        description: "grpcurl version to embed (default: value in Dockerfile ARG)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build multi-arch image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # needed to push to ghcr.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/worker
+          tags: |
+            # Always push a 'latest' tag so the default values.yaml works
+            # out of the box without pinning (pin for production use).
+            type=raw,value=latest
+            # Date-stamped tag for deterministic rollbacks: e.g. 20260512
+            type=raw,value={{date 'YYYYMMDD'}}
+            # Short git SHA for traceability
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Pass an overridden grpcurl version when triggered manually.
+          build-args: |
+            ${{ inputs.grpcurl_version && format('GRPCURL_VERSION={0}', inputs.grpcurl_version) || '' }}
+          # Use GitHub Actions cache to avoid re-downloading layers on
+          # unchanged base images (speeds up weekly rebuilds significantly).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest summary
+        run: |
+          echo "### Image built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | \`ghcr.io/${{ github.repository }}/worker\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platforms | \`linux/amd64\`, \`linux/arm64\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
