@@ -880,7 +880,7 @@ jobs:
             -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
 
           ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
-          echo "[ERROR] lines in worker logs: ${ERROR_COUNT}"
+          echo "[INFO] lines in worker logs: ${ERROR_COUNT}"
           if [[ "${ERROR_COUNT}" -gt 0 ]]; then
             echo "[FAIL] Worker pod logged ERROR lines:"
             echo "$WORKER_LOGS" | grep '\[ERROR\]'
@@ -896,7 +896,7 @@ jobs:
             exit 1
           fi
 
-          echo "[PASS] Worker pod exited 0; no [ERROR] lines found"
+          echo "[PASS] Worker pod exited 0; no error lines found"
 
       - name: "[T1] Assert Longhorn actualSize shrank after luks-trim"
         run: |
@@ -964,6 +964,10 @@ jobs:
           JOB="luks-trim-dryrun-${TS}"
           echo "job=${JOB}" >> "$GITHUB_OUTPUT"
 
+          # Snapshot existing worker jobs BEFORE creating the dry-run coordinator.
+          PREV_JOBS=$(kubectl get jobs -n luks-trim \
+            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
           print_console_logs() {
             local section="$1"
             local selector="$2"
@@ -1021,26 +1025,27 @@ jobs:
           # Find the worker Job created by this coordinator run.
           DEADLINE=$(( SECONDS + 60 ))
           WORKER_JOB=""
-          # Record worker Jobs that existed before this run so we can find the
-          # new one even if T1's Job is still in the namespace.
-          PREV_JOBS=$(kubectl get jobs -n luks-trim \
-            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
           until [[ $SECONDS -ge $DEADLINE ]]; do
-            NEW_JOB=$(kubectl get jobs -n luks-trim \
+            for NEW_JOB in $(kubectl get jobs -n luks-trim \
               -l "luks-trim/role=worker" \
               --sort-by='.metadata.creationTimestamp' \
-              -o name 2>/dev/null | tail -1 | sed 's|job.batch/||')
-            # Accept the job if it wasn't in the pre-run list.
-            if [[ -n "$NEW_JOB" ]] && \
-               ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
-              WORKER_JOB="$NEW_JOB"
-              break
-            fi
+              -o name 2>/dev/null | sed 's|job.batch/||'); do
+              # Accept any worker job not present in the pre-run snapshot.
+              if ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
+                WORKER_JOB="$NEW_JOB"
+              fi
+            done
+            [[ -n "$WORKER_JOB" ]] && break
             sleep 3
           done
 
           if [[ -z "$WORKER_JOB" ]]; then
             echo "[FAIL] No new worker Job appeared within 60 s"
+            echo "[diagnostic] worker jobs before dry-run coordinator:"
+            echo "$PREV_JOBS"
+            echo "[diagnostic] current worker jobs:"
+            kubectl get jobs -n luks-trim -l "luks-trim/role=worker" \
+              --sort-by='.metadata.creationTimestamp' -o wide || true
             print_namespace_events "dryrun-worker-missing"
             exit 1
           fi
