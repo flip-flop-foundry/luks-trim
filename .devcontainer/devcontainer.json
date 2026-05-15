@@ -1,0 +1,55 @@
+{
+  "name": "luks-trim",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+
+  // ─── Features ────────────────────────────────────────────────────────────
+  // Each feature installs one focused set of tools. Versions are pinned to
+  // major/feature versions and auto-resolve the latest within that series.
+  "features": {
+    // Forwards the host Docker / Podman socket into the container so that
+    // `docker build` works without Docker-in-Docker overhead.
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false,
+      "installDockerBuildx": false
+    },
+
+    // helm (latest) + kubectl (latest). minikube is excluded.
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "latest",
+      "helm": "latest",
+      "minikube": "none"
+    },
+
+    // gh — required by scripts/gha-loop.sh
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "latest"
+    }
+  },
+
+  // ─── Post-create setup ───────────────────────────────────────────────────
+  // Installs tooling that has no devcontainer feature: talosctl + yamllint.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  // ─── VS Code extensions ──────────────────────────────────────────────────
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "redhat.vscode-yaml",
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        "tim-koehler.helm-intellisense",
+        "GitHub.vscode-github-actions",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "yaml.schemas": {
+          "https://json.schemastore.org/chart.json": "Chart.yaml",
+          "https://json.schemastore.org/helmfile.json": "values.yaml"
+        },
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  // Run as the default non-root user provided by the base image.
+  "remoteUser": "vscode"
+}

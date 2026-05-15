@@ -170,3 +170,38 @@ subjects:
     namespace: {{ include "luks-trim.namespace" $ }}
 {{- end }}
 {{- end }}
+
+{{- if and .Values.talos.enabled .Values.talos.staticKey.enabled .Values.talos.staticKey.secretName }}
+---
+# Role: read the Talos static LUKS passphrase secret.
+# Created in the namespace where the secret lives (defaults to chart namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-talos-static-key-reader
+  namespace: {{ include "luks-trim.staticKeyNamespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.talos.staticKey.secretName | quote }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "luks-trim.fullname" . }}-talos-static-key-reader
+  namespace: {{ include "luks-trim.staticKeyNamespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "luks-trim.fullname" . }}-talos-static-key-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "luks-trim.serviceAccountName" . }}
+    namespace: {{ include "luks-trim.namespace" . }}
+{{- end }}

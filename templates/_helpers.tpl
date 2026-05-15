@@ -68,11 +68,24 @@ Namespace for the global key secret. Falls back to chart namespace.
 {{- end }}
 
 {{/*
-Validate that talos.kmsEndpoint is set when talos.enabled is true.
+Validate that talos.kmsEndpoint is set when talos.enabled is true and
+staticKey.enabled is false. With staticKey.enabled=true the KMS path is
+optional (static key is used as the sole or fallback unlock mechanism).
 Produces a hard render-time error rather than a silent runtime failure.
 */}}
 {{- define "luks-trim.kmsEndpoint" -}}
 {{- if .Values.talos.enabled -}}
-{{- required "talos.kmsEndpoint is required when talos.enabled is true. Set it to \"https://<host>:<port>\"." .Values.talos.kmsEndpoint }}
+{{- if not .Values.talos.staticKey.enabled -}}
+{{- required "talos.kmsEndpoint is required when talos.enabled is true and talos.staticKey.enabled is false. Set kmsEndpoint to \"https://<host>:<port>\" or enable talos.staticKey." .Values.talos.kmsEndpoint }}
+{{- else -}}
+{{- .Values.talos.kmsEndpoint -}}
 {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Namespace for the Talos static key secret. Falls back to chart namespace.
+*/}}
+{{- define "luks-trim.staticKeyNamespace" -}}
+{{- .Values.talos.staticKey.secretNamespace | default (include "luks-trim.namespace" .) }}
 {{- end }}

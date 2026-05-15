@@ -1,0 +1,54 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+
+# ─── Base packages ────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      ca-certificates \
+      gnupg \
+      apt-transport-https \
+      jq \
+      git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── kubectl ─────────────────────────────────────────────────────────────────
+RUN set -eux; \
+    STABLE=$(curl -sSfL https://dl.k8s.io/release/stable.txt); \
+    case "$(uname -m)" in \
+      x86_64)  GA=amd64 ;; \
+      aarch64) GA=arm64 ;; \
+    esac; \
+    curl -sSfL "https://dl.k8s.io/release/${STABLE}/bin/linux/${GA}/kubectl" \
+      -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl && \
+    kubectl version --client
+
+# ─── Helm ────────────────────────────────────────────────────────────────────
+RUN curl -sSfL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# ─── GitHub CLI (gh) ─────────────────────────────────────────────────────────
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# ─── Docker CLI (mirrors docker-outside-of-docker feature) ───────────────────
+RUN install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu noble stable" \
+      > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
+    rm -rf /var/lib/apt/lists/*
+
+# ─── post-create.sh (installs talosctl + yamllint, verifies all tools) ───────
+COPY post-create.sh /tmp/post-create.sh
+RUN bash /tmp/post-create.sh

@@ -1,6 +1,6 @@
 ---
 name: integration-test-triage
-description: "Use when: triaging failures in the Integration Tests GitHub Actions workflow for this repo (Talos QEMU, Longhorn install, luks-trim T1/T2 checks). Triggers: integration test failed, talos qemu failure, longhorn install failed, dry-run assertion failed, fstrim test failed, gha integration triage."
+description: "Use when: triaging failures in the Integration Tests GitHub Actions workflow for this repo (Talos QEMU, Longhorn install, luks-trim T0/T1/T2/T3 checks). Triggers: integration test failed, talos qemu failure, longhorn install failed, dry-run assertion failed, fstrim test failed, gha integration triage."
 ---
 
 # Integration Test Triage Skill

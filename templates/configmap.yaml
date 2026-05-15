@@ -10,14 +10,18 @@ data:
     #!/bin/sh
     # luks-trim worker script — run once per node, then exit.
     # Env vars injected by the per-node Job spec:
-    #   LONGHORN_ENABLED      "true" | "false"
-    #   TALOS_ENABLED         "true" | "false"
-    #   KMS_ENDPOINT          https://<host>:<port>
-    #   GLOBAL_KEY_ENABLED    "true" | "false"
-    #   GLOBAL_KEY_NS         namespace of the global key secret
-    #   GLOBAL_KEY_SECRET     name of the global key secret
-    #   GLOBAL_KEY_FIELD      data field name inside the secret
-    #   DRY_RUN               "true" | "false" — skip all writes when true
+    #   LONGHORN_ENABLED           "true" | "false"
+    #   TALOS_ENABLED              "true" | "false"
+    #   KMS_ENDPOINT               https://<host>:<port>  (empty = skip KMS path)
+    #   GLOBAL_KEY_ENABLED         "true" | "false"
+    #   GLOBAL_KEY_NS              namespace of the global key secret
+    #   GLOBAL_KEY_SECRET          name of the global key secret
+    #   GLOBAL_KEY_FIELD           data field name inside the secret
+    #   DRY_RUN                    "true" | "false" — skip all writes when true
+    #   TALOS_STATIC_KEY_ENABLED   "true" | "false"
+    #   TALOS_STATIC_KEY_NS        namespace of the static key secret
+    #   TALOS_STATIC_KEY_SECRET    name of the static key secret
+    #   TALOS_STATIC_KEY_FIELD     data field name inside the secret
     #
     # All required tools (cryptsetup, dmsetup, fstrim, jq, curl, grpcurl) are
     # pre-installed in the custom Ubuntu worker image built by the GitHub Actions
@@ -264,14 +268,38 @@ data:
     # Volumes appear as /dev/mapper/luks2-<partition-uuid>.
     # LUKS2 headers contain a sideroKMS token with UserData.sealedData.
     # Flow: read sealedData → KMS Unseal(nodeUUID, sealedData) → passphrase.
+    #
+    # When talos.staticKey.enabled is true, the static passphrase is tried
+    # as a fallback after sideroKMS (or as the primary when kmsEndpoint is
+    # empty). This mirrors Talos itself, which supports multiple key slots.
     process_talos_volumes() {
       echo "--- Checking Talos LUKS volumes..."
-      _node_uuid=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | tr '[:upper:]' '[:lower:]')
-      if [ -z "$_node_uuid" ]; then
-        echo "  [ERROR] cannot read node UUID from /sys/class/dmi/id/product_uuid — skipping Talos volumes"
+
+      _kms_host=$(printf '%s' "$KMS_ENDPOINT" | sed 's|^https://||')
+      _kms_available=false
+      if [ -n "$_kms_host" ]; then
+        _kms_available=true
+        # Node UUID is required for KMS Unseal requests.
+        _node_uuid=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        if [ -z "$_node_uuid" ]; then
+          echo "  [WARN] cannot read node UUID from /sys/class/dmi/id/product_uuid — KMS path disabled"
+          _kms_available=false
+        fi
+      fi
+
+      _static_key_b64=""
+      if [ "${TALOS_STATIC_KEY_ENABLED:-false}" = "true" ] && [ -n "$TALOS_STATIC_KEY_SECRET" ]; then
+        _static_key_b64=$(fetch_secret_key "$TALOS_STATIC_KEY_NS" "$TALOS_STATIC_KEY_SECRET" "$TALOS_STATIC_KEY_FIELD")
+        if [ -z "$_static_key_b64" ]; then
+          echo "  [WARN] static key secret $TALOS_STATIC_KEY_NS/$TALOS_STATIC_KEY_SECRET not found or empty"
+        fi
+      fi
+
+      if ! $_kms_available && [ -z "$_static_key_b64" ]; then
+        echo "  [ERROR] no unlock path available: KMS endpoint is empty/unreachable and no static key configured"
         return 1
       fi
-      _kms_host=$(printf '%s' "$KMS_ENDPOINT" | sed 's|^https://||')
+
       _found=false
       _failed=0
       for _mp in /dev/mapper/luks2-*; do
@@ -291,58 +319,73 @@ data:
             continue
           fi
           echo "    backing: $_backing"
-          # Scan all 32 LUKS2 token slots (0–31) until we find the sideroKMS token.
-          # Other tools (e.g. systemd-cryptsetup) may occupy low-numbered slots,
-          # pushing the sideroKMS token beyond the previously hard-coded range of 0–7.
-          _sealed=""
-          _tid=0
-          while [ "$_tid" -le 31 ]; do
-            _tj=$(cryptsetup token export --token-id "$_tid" "$_backing" 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$_tj" ]; then
-              _type=$(printf '%s' "$_tj" | jq -r '.type // empty' 2>/dev/null)
-              if [ "$_type" = "sideroKMS" ]; then
-                _sealed=$(printf '%s' "$_tj" \
-                  | jq -r '.UserData.sealedData // .userData.sealedData // .sealedData // empty')
-                [ -n "$_sealed" ] && break
+
+          # ── KMS path ────────────────────────────────────────────────────
+          if $_kms_available; then
+            # Scan all 32 LUKS2 token slots (0–31) until we find the sideroKMS token.
+            # Other tools (e.g. systemd-cryptsetup) may occupy low-numbered slots,
+            # pushing the sideroKMS token beyond the previously hard-coded range of 0–7.
+            _sealed=""
+            _tid=0
+            while [ "$_tid" -le 31 ]; do
+              _tj=$(cryptsetup token export --token-id "$_tid" "$_backing" 2>/dev/null)
+              if [ $? -eq 0 ] && [ -n "$_tj" ]; then
+                _type=$(printf '%s' "$_tj" | jq -r '.type // empty' 2>/dev/null)
+                if [ "$_type" = "sideroKMS" ]; then
+                  _sealed=$(printf '%s' "$_tj" \
+                    | jq -r '.UserData.sealedData // .userData.sealedData // .sealedData // empty')
+                  [ -n "$_sealed" ] && break
+                fi
               fi
+              _tid=$(( _tid + 1 ))
+            done
+
+            if [ -n "$_sealed" ]; then
+              # Build the KMS request using jq to guarantee valid JSON regardless of
+              # special characters in _sealed or _node_uuid.
+              _req=$(jq -n \
+                --arg uuid "$_node_uuid" \
+                --arg data "$_sealed" \
+                '{"node_uuid": $uuid, "data": $data}')
+              _resp=$(grpcurl \
+                -cacert /etc/ssl/certs/ca-certificates.crt \
+                -import-path /tmp -proto kms.proto \
+                -d "$_req" \
+                "$_kms_host" sidero.kms.KMSService/Unseal 2>/dev/null)
+              if [ -n "$_resp" ]; then
+                _pass=$(printf '%s' "$_resp" | jq -r '.data // empty')
+                if [ -n "$_pass" ]; then
+                  _key_b64=$(printf '%s' "$_pass" | base64 | tr -d '\n')
+                  if try_key "$_backing" "$_dm" "$_key_b64" "talos-kms"; then
+                    _discard_ok=true
+                  else
+                    echo "    [WARN] KMS key did not unlock $_dm — will try static key if configured"
+                  fi
+                else
+                  echo "    [WARN] KMS returned empty passphrase for $_dm"
+                fi
+              else
+                echo "    [WARN] KMS unseal failed for $_dm — verbose output:"
+                grpcurl -v -cacert /etc/ssl/certs/ca-certificates.crt \
+                  -import-path /tmp -proto kms.proto -d "$_req" \
+                  "$_kms_host" sidero.kms.KMSService/Unseal || true
+              fi
+            else
+              echo "    [INFO] no sideroKMS token in LUKS2 header of $_backing (scanned slots 0–31)"
             fi
-            _tid=$(( _tid + 1 ))
-          done
-          if [ -z "$_sealed" ]; then
-            echo "    [ERROR] no sideroKMS token found in LUKS2 header of $_backing (scanned slots 0–31)"
-            _failed=$(( _failed + 1 ))
-            continue
           fi
-          # Build the KMS request using jq to guarantee valid JSON regardless of
-          # special characters in _sealed or _node_uuid.
-          _req=$(jq -n \
-            --arg uuid "$_node_uuid" \
-            --arg data "$_sealed" \
-            '{"node_uuid": $uuid, "data": $data}')
-          _resp=$(grpcurl \
-            -cacert /etc/ssl/certs/ca-certificates.crt \
-            -import-path /tmp -proto kms.proto \
-            -d "$_req" \
-            "$_kms_host" sidero.kms.KMSService/Unseal 2>/dev/null)
-          if [ -z "$_resp" ]; then
-            echo "    [ERROR] KMS unseal failed for $_dm — verbose output:"
-            grpcurl -v -cacert /etc/ssl/certs/ca-certificates.crt \
-              -import-path /tmp -proto kms.proto -d "$_req" \
-              "$_kms_host" sidero.kms.KMSService/Unseal
-            _failed=$(( _failed + 1 ))
-            continue
+
+          # ── Static key path (fallback or primary) ────────────────────────
+          if ! $_discard_ok && [ -n "$_static_key_b64" ]; then
+            if try_key "$_backing" "$_dm" "$_static_key_b64" "talos-static"; then
+              _discard_ok=true
+            else
+              echo "    [WARN] static key did not unlock $_dm"
+            fi
           fi
-          _pass=$(printf '%s' "$_resp" | jq -r '.data // empty')
-          if [ -z "$_pass" ]; then
-            echo "    [ERROR] KMS returned empty passphrase for $_dm"
-            _failed=$(( _failed + 1 ))
-            continue
-          fi
-          _key_b64=$(printf '%s' "$_pass" | base64 | tr -d '\n')
-          if try_key "$_backing" "$_dm" "$_key_b64" "talos-kms"; then
-            _discard_ok=true
-          else
-            echo "    [ERROR] cryptsetup refresh failed for $_dm"
+
+          if ! $_discard_ok; then
+            echo "    [ERROR] no key unlocked $_dm — allow-discards NOT enabled"
             _failed=$(( _failed + 1 ))
           fi
         fi
@@ -350,7 +393,7 @@ data:
       done
       $_found || echo "  No /dev/mapper/luks2-* devices on this node"
       if [ "$_failed" -gt 0 ]; then
-        echo "  [ERROR] $_failed Talos volume(s) failed. Check KMS connectivity and LUKS2 headers."
+        echo "  [ERROR] $_failed Talos volume(s) failed. Check KMS connectivity, LUKS2 headers, and static key config."
         return 1
       fi
     }

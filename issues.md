@@ -200,6 +200,9 @@ pod-security.kubernetes.io/audit=privileged \
 pod-security.kubernetes.io/warn=privileged \
 
 
+* The currenty configmap/script is very hard to ready, improve this.
+
+
 # 6. Test improvments
 
  * At the time of writing we dont have any tests for dry-run on new volumes (volumes that havent had discard enabled)

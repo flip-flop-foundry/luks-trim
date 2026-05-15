@@ -8,6 +8,11 @@
 #
 # Key test scenarios
 # ──────────────────
+# T0  Dry-run on new volume – verify dry-run works on a fresh encrypted
+#     volume that has NEVER had allow-discards enabled. Confirms [dry-run]
+#     lines appear (not swallowed by the "already active" fast-path) and
+#     Longhorn actualSize is unchanged.
+#
 # T1  Live run  – write 2 GiB → delete → run luks-trim (enables LUKS
 #     allow-discards) → trigger Longhorn filesystem-trim CronJob →
 #     assert Longhorn actualSize shrank.
@@ -758,12 +763,6 @@ jobs:
       - name: Install luks-trim chart
         run: |
           IMAGE="${{ inputs.worker-image }}"
-          kubectl create namespace luks-trim --dry-run=client -o yaml | kubectl apply -f -
-          kubectl label namespace luks-trim \
-            pod-security.kubernetes.io/enforce=privileged \
-            pod-security.kubernetes.io/audit=privileged \
-            pod-security.kubernetes.io/warn=privileged \
-            --overwrite
 
           # Split "repo:tag"; if no colon is present, default tag to "latest".
           if [[ "$IMAGE" == *:* ]]; then
@@ -774,9 +773,11 @@ jobs:
             TAG="latest"
           fi
 
+          # The chart creates the namespace with pod-security labels via the
+          # Namespace template (createNamespace=true by default). No need to
+          # pre-create or label the namespace manually.
           helm upgrade --install luks-trim . \
             --namespace   luks-trim \
-            --create-namespace \
             --set image.repository="${REPO}" \
             --set image.tag="${TAG}" \
             --set longhorn.enabled=true \
@@ -789,6 +790,199 @@ jobs:
             --set 'schedule=0 3 1 1 *'   # dormant; jobs triggered manually
 
           kubectl -n luks-trim get all
+
+      # ======================================================================
+      # T0 — DRY-RUN ON NEW (NEVER-TRIMMED) VOLUME
+      #
+      # Validates that the dry-run path works on a fresh encrypted volume
+      # where allow-discards has NEVER been enabled before.  T2 (below) runs
+      # dry-run after T1 has already enabled allow-discards, so the worker
+      # hits the "already active" fast-path instead.  T0 closes that gap.
+      #
+      # 1. Create a fresh encrypted PVC + pod.
+      # 2. Write 256 MiB to give the worker something to report on.
+      # 3. Upgrade chart with dryRun=true.
+      # 4. Run luks-trim → assert [dry-run] lines present, no [ERROR] lines.
+      # 5. Assert Longhorn actualSize unchanged (fstrim must NOT have run).
+      # 6. Restore chart to dryRun=false and delete the T0 PVC/pod.
+      # ======================================================================
+
+      - name: "[T0] Create fresh encrypted PVC and pod"
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: t0-new-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-global-key
+            resources:
+              requests:
+                storage: 512Mi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t0-filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: t0-new-vol
+            restartPolicy: Never
+          EOF
+          kubectl wait pod/t0-filler -n luks-trim-test \
+            --for=condition=Ready --timeout=5m
+
+      - name: "[T0] Write 256 MiB to fresh volume"
+        run: |
+          kubectl exec t0-filler -n luks-trim-test -- \
+            dd if=/dev/urandom of=/data/t0-file.bin bs=1M count=256 status=none
+          kubectl exec t0-filler -n luks-trim-test -- sync
+
+      - name: "[T0] Capture actualSize before dry-run"
+        id: t0-before
+        run: |
+          sleep 15
+          VOL_NAME=$(kubectl get pvc t0-new-vol -n luks-trim-test \
+            -o jsonpath='{.spec.volumeName}')
+          echo "vol_name=${VOL_NAME}" >> "$GITHUB_OUTPUT"
+          SIZE=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "T0 actualSize before dry-run: ${SIZE} bytes"
+
+      - name: "[T0] Upgrade chart: dryRun=true"
+        run: |
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set dryRun=true
+
+      - name: "[T0] Run luks-trim dry-run on new volume"
+        id: t0-dryrun-job
+        run: |
+          TS=$(date +%s)
+          JOB="luks-trim-t0-${TS}"
+          echo "job=${JOB}" >> "$GITHUB_OUTPUT"
+
+          PREV_JOBS=$(kubectl get jobs -n luks-trim \
+            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
+          kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
+
+          if ! kubectl wait -n luks-trim --for=condition=complete "job/${JOB}" --timeout=5m; then
+            echo "[FAIL] T0 coordinator ${JOB} did not complete"
+            kubectl get "job/${JOB}" -n luks-trim -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            exit 1
+          fi
+
+          DEADLINE=$(( SECONDS + 60 ))
+          WORKER_JOB=""
+          until [[ $SECONDS -ge $DEADLINE ]]; do
+            for NEW_JOB in $(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" \
+              --sort-by='.metadata.creationTimestamp' \
+              -o name 2>/dev/null | sed 's|job.batch/||'); do
+              if ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
+                WORKER_JOB="$NEW_JOB"
+              fi
+            done
+            [[ -n "$WORKER_JOB" ]] && break
+            sleep 3
+          done
+
+          if [[ -z "$WORKER_JOB" ]]; then
+            echo "[FAIL] No worker Job appeared within 60 s for T0"
+            exit 1
+          fi
+          echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
+
+          if ! kubectl wait -n luks-trim --for=condition=complete "job/${WORKER_JOB}" --timeout=5m; then
+            echo "[FAIL] T0 worker ${WORKER_JOB} did not complete"
+            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
+            exit 1
+          fi
+
+          echo "===== [T0 worker logs] BEGIN ====="
+          kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
+          echo "===== [T0 worker logs] END ====="
+
+      - name: "[T0] Assert [dry-run] lines on new volume and no [ERROR] lines"
+        run: |
+          WORKER_JOB="${{ steps.t0-dryrun-job.outputs.worker_job }}"
+          LOGS=$(kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
+
+          DRYRUN_COUNT=$(echo "$LOGS" | grep -c '\[dry-run\]' || true)
+          ERROR_COUNT=$(echo "$LOGS"  | grep -c '\[ERROR\]'   || true)
+          echo "[dry-run] lines: ${DRYRUN_COUNT}"
+          echo "[ERROR]   lines: ${ERROR_COUNT}"
+
+          # On a brand-new volume allow-discards is NOT yet active, so [dry-run]
+          # lines MUST appear (unlike T2 where they may be absent if T1 already
+          # set the flag).
+          if [[ "${DRYRUN_COUNT}" -eq 0 ]]; then
+            echo "[FAIL] Expected [dry-run] lines on new volume but found none"
+            echo "$LOGS"
+            exit 1
+          fi
+
+          if [[ "${ERROR_COUNT}" -gt 0 ]]; then
+            echo "[FAIL] [ERROR] lines present during T0 dry-run:"
+            echo "$LOGS" | grep '\[ERROR\]'
+            exit 1
+          fi
+
+          echo "[PASS] T0: [dry-run] lines present and no errors on fresh volume"
+
+      - name: "[T0] Assert actualSize unchanged after dry-run"
+        run: |
+          VOL_NAME="${{ steps.t0-before.outputs.vol_name }}"
+          SIZE_AFTER=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          SIZE_BEFORE="${{ steps.t0-before.outputs.size }}"
+          echo "Before: ${SIZE_BEFORE} bytes"
+          echo "After:  ${SIZE_AFTER} bytes"
+
+          if [[ "$SIZE_AFTER" -ge "$SIZE_BEFORE" ]]; then
+            DELTA=$(( SIZE_AFTER - SIZE_BEFORE ))
+          else
+            DELTA=$(( SIZE_BEFORE - SIZE_AFTER ))
+          fi
+          THRESHOLD=$(( SIZE_BEFORE * 5 / 100 ))
+
+          if [[ "${DELTA}" -gt "${THRESHOLD}" ]]; then
+            echo "[FAIL] actualSize changed by ${DELTA} bytes during T0 dry-run (threshold ${THRESHOLD})"
+            exit 1
+          fi
+
+          echo "[PASS] T0: actualSize stable during dry-run (delta: ${DELTA} bytes)"
+
+      - name: "[T0] Restore chart: dryRun=false and clean up T0 resources"
+        run: |
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set dryRun=false
+
+          kubectl delete pod t0-filler -n luks-trim-test --ignore-not-found=true
+          kubectl delete pvc t0-new-vol -n luks-trim-test --ignore-not-found=true
+          kubectl wait --for=delete pod/t0-filler -n luks-trim-test --timeout=3m || true
+          kubectl wait --for=delete pvc/t0-new-vol -n luks-trim-test --timeout=3m || true
 
       # ======================================================================
       # T1 — LIVE RUN

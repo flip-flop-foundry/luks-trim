@@ -1,0 +1,11 @@
+{{- if .Values.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "luks-trim.namespace" . }}
+  labels:
+    {{- include "luks-trim.labels" . | nindent 4 }}
+    {{- with .Values.namespaceLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

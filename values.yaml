@@ -16,6 +16,22 @@
 namespace: luks-trim
 
 # ---------------------------------------------------------------------------
+# Namespace labels
+# ---------------------------------------------------------------------------
+# Labels applied to the chart namespace when the chart manages its own
+# Namespace resource (i.e. when createNamespace is true).
+#
+# The defaults enforce a privileged Pod Security Standard so that worker
+# Jobs can run with the elevated privileges they need (hostPID, privileged
+# container, etc.). Remove or override if your cluster enforces these labels
+# at admission time through another mechanism (e.g. OPA/Gatekeeper).
+createNamespace: true
+namespaceLabels:
+  pod-security.kubernetes.io/enforce: privileged
+  pod-security.kubernetes.io/audit: privileged
+  pod-security.kubernetes.io/warn: privileged
+
+# ---------------------------------------------------------------------------
 # Image
 # ---------------------------------------------------------------------------
 # Both the coordinator and the per-node worker Jobs use this image.
@@ -144,10 +160,34 @@ talos:
   enabled: false
 
   # gRPC endpoint of the Talos KMS server used to unseal LUKS2 volume keys.
-  # Required when talos.enabled is true.
+  # Required when talos.enabled is true and sideroKMS key slots are present.
   # Format: https://<host>:<port>  (scheme is required; stripped internally)
   kmsEndpoint: ""
   # Example: kmsEndpoint: "https://kms.example.com:50051"
+
+  # -- Static passphrase key (Talos `static` key kind) --
+  # Talos supports a `static` key kind where a plain passphrase is stored in
+  # the Talos machine config rather than sealed by a KMS server. There is no
+  # LUKS2 token associated with this key kind — the passphrase is used directly.
+  #
+  # When enabled, the worker fetches the passphrase from the named Kubernetes
+  # Secret and tries it as a fallback after the sideroKMS path (or as the
+  # primary unlock method when kmsEndpoint is empty).
+  #
+  # Operator steps:
+  #   1. Create a Secret containing the passphrase:
+  #        kubectl create secret generic talos-static-key \
+  #          --namespace luks-trim \
+  #          --from-literal=passphrase=<your-passphrase>
+  #   2. Set talos.staticKey.enabled=true and point at that secret.
+  staticKey:
+    enabled: false
+    # Name of the Kubernetes Secret containing the static passphrase.
+    secretName: ""
+    # Namespace where the secret lives. Defaults to the chart namespace.
+    secretNamespace: ""
+    # Key within secret.data that holds the passphrase.
+    secretKey: "passphrase"
 
 # ---------------------------------------------------------------------------
 # grpcurl — embedded in the custom worker image; no runtime download.

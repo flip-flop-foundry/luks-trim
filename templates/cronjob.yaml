@@ -59,6 +59,14 @@ spec:
                   value: {{ .Values.longhorn.globalKey.secretKey | quote }}
                 - name: LONGHORN_DEVICE_PATH
                   value: {{ .Values.longhorn.devicePath | quote }}
+                - name: TALOS_STATIC_KEY_ENABLED
+                  value: {{ (and .Values.talos.enabled .Values.talos.staticKey.enabled) | toString | quote }}
+                - name: TALOS_STATIC_KEY_NS
+                  value: {{ include "luks-trim.staticKeyNamespace" . | quote }}
+                - name: TALOS_STATIC_KEY_SECRET
+                  value: {{ .Values.talos.staticKey.secretName | quote }}
+                - name: TALOS_STATIC_KEY_FIELD
+                  value: {{ .Values.talos.staticKey.secretKey | quote }}
                 - name: CHART_NAMESPACE
                   value: {{ include "luks-trim.namespace" . | quote }}
                 - name: WORKER_IMAGE
@@ -141,6 +149,10 @@ spec:
                       --arg gkfield    "$GLOBAL_KEY_FIELD" \
                       --arg devpath    "$LONGHORN_DEVICE_PATH" \
                       --arg dr         "$DRY_RUN" \
+                      --arg tske       "$TALOS_STATIC_KEY_ENABLED" \
+                      --arg tskns      "$TALOS_STATIC_KEY_NS" \
+                      --arg tsksec     "$TALOS_STATIC_KEY_SECRET" \
+                      --arg tskfield   "$TALOS_STATIC_KEY_FIELD" \
                       --argjson tols   "$TOLERATIONS_JSON" \
                       --argjson res    "$WORKER_RESOURCES_JSON" \
                       --argjson ips    "$IMAGE_PULL_SECRETS_JSON" \
@@ -184,15 +196,19 @@ spec:
                                 securityContext: {privileged: true},
                                 resources: $res,
                                 env: [
-                                  {name: "LONGHORN_ENABLED",    value: $le},
-                                  {name: "TALOS_ENABLED",       value: $te},
-                                  {name: "KMS_ENDPOINT",        value: $kms},
-                                  {name: "GLOBAL_KEY_ENABLED",  value: $gke},
-                                  {name: "GLOBAL_KEY_NS",       value: $gkns},
-                                  {name: "GLOBAL_KEY_SECRET",   value: $gksec},
-                                  {name: "GLOBAL_KEY_FIELD",    value: $gkfield},
-                                  {name: "LONGHORN_DEVICE_PATH",value: $devpath},
-                                  {name: "DRY_RUN",             value: $dr}
+                                  {name: "LONGHORN_ENABLED",           value: $le},
+                                  {name: "TALOS_ENABLED",              value: $te},
+                                  {name: "KMS_ENDPOINT",               value: $kms},
+                                  {name: "GLOBAL_KEY_ENABLED",         value: $gke},
+                                  {name: "GLOBAL_KEY_NS",              value: $gkns},
+                                  {name: "GLOBAL_KEY_SECRET",          value: $gksec},
+                                  {name: "GLOBAL_KEY_FIELD",           value: $gkfield},
+                                  {name: "LONGHORN_DEVICE_PATH",       value: $devpath},
+                                  {name: "DRY_RUN",                    value: $dr},
+                                  {name: "TALOS_STATIC_KEY_ENABLED",   value: $tske},
+                                  {name: "TALOS_STATIC_KEY_NS",        value: $tskns},
+                                  {name: "TALOS_STATIC_KEY_SECRET",    value: $tsksec},
+                                  {name: "TALOS_STATIC_KEY_FIELD",     value: $tskfield}
                                 ],
                                 command: ["/bin/sh", "/scripts/trim.sh"],
                                 volumeMounts: [
