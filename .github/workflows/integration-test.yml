@@ -566,11 +566,6 @@ jobs:
       - name: Create test namespace and LUKS key secret
         run: |
           kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
-          kubectl label namespace luks-trim-test \
-            pod-security.kubernetes.io/enforce=privileged \
-            pod-security.kubernetes.io/audit=privileged \
-            pod-security.kubernetes.io/warn=privileged \
-            --overwrite
 
           # Random passphrase — strong enough for a CI test.
           PASSPHRASE=$(openssl rand -base64 32)
@@ -638,9 +633,6 @@ jobs:
               - name: filler
                 image: ubuntu:24.04
                 command: ["sleep", "3600"]
-                securityContext:
-                  runAsUser: 0
-                  privileged: true
                 volumeMounts:
                   - name: data
                     mountPath: /data
@@ -701,9 +693,8 @@ jobs:
       #
       # 1. Write 2 GiB → assert Longhorn actualSize grew
       # 2. Delete file  → assert actualSize did NOT automatically shrink
-      # 3. Run luks-trim (sets LUKS allow-discards on running device)
-      # 4. fstrim inside pod → FITRIM propagates through ext4→dm-crypt→Longhorn
-      # 5. Assert actualSize shrank (best-effort; warn if < 1 GiB reclaimed)
+      # 3. Run luks-trim cronjob manually
+      # 4. Assert actualSize shrank (best-effort; warn if < 1 GiB reclaimed)
       # ======================================================================
 
       - name: "[T1] Write 2 GiB to encrypted volume"
@@ -759,9 +750,24 @@ jobs:
           JOB="luks-trim-live-${TS}"
           echo "job=${JOB}" >> "$GITHUB_OUTPUT"
 
+          print_console_logs() {
+            local section="$1"
+            local selector="$2"
+            echo "===== [logs:${section}] BEGIN ====="
+            kubectl logs -n luks-trim -l "$selector" --prefix=true --tail=-1 || true
+            echo "===== [logs:${section}] END ====="
+          }
+
+          print_namespace_events() {
+            local section="$1"
+            echo "===== [events:${section}] BEGIN ====="
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            echo "===== [events:${section}] END ====="
+          }
+
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
 
-          # Poll coordinator progress so we keep seeing job status, logs, and events.
+          # Poll coordinator progress with concise status output.
           COORD_DEADLINE=$(( SECONDS + 300 ))
           while true; do
             COORD_SUCCEEDED=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)
@@ -769,10 +775,9 @@ jobs:
             COORD_ACTIVE=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
 
             echo "[monitor] coordinator ${JOB}: active=${COORD_ACTIVE:-0} succeeded=${COORD_SUCCEEDED:-0} failed=${COORD_FAILED:-0}"
-            kubectl get "job/${JOB}" -n luks-trim -o wide || true
-            kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
-            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=120 || true
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+            kubectl get pods -n luks-trim -l "job-name=${JOB}" \
+              -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' \
+              --no-headers 2>/dev/null || true
 
             if (( ${COORD_SUCCEEDED:-0} >= 1 )); then
               break
@@ -780,16 +785,26 @@ jobs:
 
             if (( ${COORD_FAILED:-0} >= 1 )); then
               echo "[FAIL] Coordinator job ${JOB} failed"
+              kubectl get "job/${JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+              print_console_logs "coordinator-failed" "job-name=${JOB}"
+              print_namespace_events "coordinator-failed"
               exit 1
             fi
 
             if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
               echo "[FAIL] Coordinator job ${JOB} did not complete within timeout"
+              kubectl get "job/${JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+              print_console_logs "coordinator-timeout" "job-name=${JOB}"
+              print_namespace_events "coordinator-timeout"
               exit 1
             fi
 
             sleep 15
           done
+
+          print_console_logs "coordinator" "job-name=${JOB}"
 
           echo "Coordinator complete; waiting for worker Job to appear…"
           # The coordinator creates one worker Job per node. Poll until it
@@ -808,7 +823,7 @@ jobs:
 
           if [[ -z "$WORKER_JOB" ]]; then
             echo "[FAIL] No worker Job appeared within 60 s of coordinator completing"
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            print_namespace_events "worker-missing"
             exit 1
           fi
           echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
@@ -821,10 +836,9 @@ jobs:
             WORKER_ACTIVE=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
 
             echo "[monitor] worker ${WORKER_JOB}: active=${WORKER_ACTIVE:-0} succeeded=${WORKER_SUCCEEDED:-0} failed=${WORKER_FAILED:-0}"
-            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
-            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
-            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=120 || true
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" \
+              -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' \
+              --no-headers 2>/dev/null || true
 
             if (( ${WORKER_SUCCEEDED:-0} >= 1 )) || (( ${WORKER_FAILED:-0} >= 1 )); then
               break
@@ -832,6 +846,10 @@ jobs:
 
             if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
               echo "[FAIL] Worker job ${WORKER_JOB} did not complete within timeout"
+              kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+              print_console_logs "worker-timeout" "job-name=${WORKER_JOB}"
+              print_namespace_events "worker-timeout"
               exit 1
             fi
 
@@ -841,10 +859,8 @@ jobs:
           echo "[diagnostic] worker job/pods:"
           kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
           kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
-          echo "[diagnostic] worker pod logs:"
-          kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
-          echo "[diagnostic] recent events in luks-trim namespace:"
-          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+          print_console_logs "worker" "job-name=${WORKER_JOB}"
+          print_namespace_events "worker-final"
 
       - name: "[T1] Assert worker pods exited 0 and contain no [ERROR] lines"
         run: |
@@ -870,18 +886,11 @@ jobs:
 
           echo "[PASS] Worker pod exited 0; no [ERROR] lines found"
 
-      - name: "[T1] Run fstrim inside filler pod (LUKS allow-discards now active)"
+      - name: "[T1] Assert Longhorn actualSize shrank after luks-trim"
         run: |
-          # luks-trim just applied --persistent refresh --allow-discards to the
-          # running dm-crypt device.  fstrim sends FITRIM through the ext4 fs →
-          # dm-crypt (discards now enabled) → Longhorn block device →
-          # hole-punch in the replica backing file.
-          kubectl exec filler -n luks-trim-test -- fstrim -v /data
-          # Allow Longhorn replica accounting to settle.
+          # Allow Longhorn replica accounting to settle after worker completion.
           sleep 30
 
-      - name: "[T1] Assert Longhorn actualSize shrank after fstrim"
-        run: |
           VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
           SIZE_NOW=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
             -n longhorn-system -o jsonpath='{.status.actualSize}')
@@ -893,15 +902,12 @@ jobs:
           RECLAIMED=$(( PRE_TRIM - SIZE_NOW ))
           echo "Reclaimed: ${RECLAIMED} bytes"
 
-          # Expect at least 1 GiB reclaimed.  If less, it is a warning rather
-          # than a hard failure: the LUKS layer correctly set allow-discards
-          # (confirmed by worker exit 0 above), but trim propagation through
-          # Longhorn's replica stack depends on the kernel version and backend
-          # filesystem.  This assertion is intentionally advisory.
+          # Expect at least 1 GiB reclaimed. If less, emit a warning rather than
+          # failing hard because reclaim timing can vary with backend behavior.
           MIN_RECLAIM=$(( 1024 * 1024 * 1024 ))
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
             echo "[WARN] Less than 1 GiB reclaimed (${RECLAIMED} bytes)."
-            echo "       Check whether fstrim output above showed non-zero bytes."
+            echo "       Check worker logs above for trim operations and reclaim output."
           else
             echo "[PASS] ${RECLAIMED} bytes freed – TRIM propagated end-to-end"
           fi
@@ -946,6 +952,21 @@ jobs:
           JOB="luks-trim-dryrun-${TS}"
           echo "job=${JOB}" >> "$GITHUB_OUTPUT"
 
+          print_console_logs() {
+            local section="$1"
+            local selector="$2"
+            echo "===== [logs:${section}] BEGIN ====="
+            kubectl logs -n luks-trim -l "$selector" --prefix=true --tail=-1 || true
+            echo "===== [logs:${section}] END ====="
+          }
+
+          print_namespace_events() {
+            local section="$1"
+            echo "===== [events:${section}] BEGIN ====="
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            echo "===== [events:${section}] END ====="
+          }
+
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
           COORD_DEADLINE=$(( SECONDS + 300 ))
           while true; do
@@ -954,10 +975,9 @@ jobs:
             COORD_ACTIVE=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
 
             echo "[monitor] dry-run coordinator ${JOB}: active=${COORD_ACTIVE:-0} succeeded=${COORD_SUCCEEDED:-0} failed=${COORD_FAILED:-0}"
-            kubectl get "job/${JOB}" -n luks-trim -o wide || true
-            kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
-            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=120 || true
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+            kubectl get pods -n luks-trim -l "job-name=${JOB}" \
+              -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' \
+              --no-headers 2>/dev/null || true
 
             if (( ${COORD_SUCCEEDED:-0} >= 1 )); then
               break
@@ -965,16 +985,26 @@ jobs:
 
             if (( ${COORD_FAILED:-0} >= 1 )); then
               echo "[FAIL] Dry-run coordinator job ${JOB} failed"
+              kubectl get "job/${JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+              print_console_logs "dryrun-coordinator-failed" "job-name=${JOB}"
+              print_namespace_events "dryrun-coordinator-failed"
               exit 1
             fi
 
             if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
               echo "[FAIL] Dry-run coordinator job ${JOB} did not complete within timeout"
+              kubectl get "job/${JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+              print_console_logs "dryrun-coordinator-timeout" "job-name=${JOB}"
+              print_namespace_events "dryrun-coordinator-timeout"
               exit 1
             fi
 
             sleep 15
           done
+
+          print_console_logs "dryrun-coordinator" "job-name=${JOB}"
 
           # Find the worker Job created by this coordinator run.
           DEADLINE=$(( SECONDS + 60 ))
@@ -999,7 +1029,7 @@ jobs:
 
           if [[ -z "$WORKER_JOB" ]]; then
             echo "[FAIL] No new worker Job appeared within 60 s"
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            print_namespace_events "dryrun-worker-missing"
             exit 1
           fi
           echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
@@ -1012,10 +1042,9 @@ jobs:
             WORKER_ACTIVE=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
 
             echo "[monitor] dry-run worker ${WORKER_JOB}: active=${WORKER_ACTIVE:-0} succeeded=${WORKER_SUCCEEDED:-0} failed=${WORKER_FAILED:-0}"
-            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
-            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
-            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=120 || true
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" \
+              -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' \
+              --no-headers 2>/dev/null || true
 
             if (( ${WORKER_SUCCEEDED:-0} >= 1 )) || (( ${WORKER_FAILED:-0} >= 1 )); then
               break
@@ -1023,6 +1052,10 @@ jobs:
 
             if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
               echo "[FAIL] Dry-run worker job ${WORKER_JOB} did not complete within timeout"
+              kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+              print_console_logs "dryrun-worker-timeout" "job-name=${WORKER_JOB}"
+              print_namespace_events "dryrun-worker-timeout"
               exit 1
             fi
 
@@ -1032,10 +1065,8 @@ jobs:
           echo "[diagnostic] dry-run worker job/pods:"
           kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
           kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
-          echo "[diagnostic] dry-run worker pod logs:"
-          kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
-          echo "[diagnostic] recent events in luks-trim namespace:"
-          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+          print_console_logs "dryrun-worker" "job-name=${WORKER_JOB}"
+          print_namespace_events "dryrun-worker-final"
 
       - name: "[T2] Assert [dry-run] lines present and no [ERROR] lines"
         run: |
