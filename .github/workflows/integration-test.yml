@@ -187,9 +187,78 @@ jobs:
                   InitiatorName=iqn.2025-01.io.longhorn:luks-trim-test
           EOF
 
+          # GitHub Actions doesn't support running steps in parallel within
+          # the same job, so we run a background heartbeat while Talos creates
+          # the cluster. This prevents long periods of silent logs.
+          MONITOR_START=$(date +%s)
+          monitor_talos_create() {
+            while true; do
+              NOW=$(date +%s)
+              ELAPSED=$(( NOW - MONITOR_START ))
+              echo "[monitor] $(date -u +%Y-%m-%dT%H:%M:%SZ) talos-create elapsed=${ELAPSED}s"
+
+              QEMU_COUNT=$(pgrep -fc qemu-system || true)
+              echo "[monitor] qemu-system process count: ${QEMU_COUNT}"
+
+              RUNNER_TALOS_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
+              ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
+              TALOS_CFG=""
+              if test -d "${RUNNER_TALOS_DIR}"; then
+                echo "[monitor] talos state dir exists: ${RUNNER_TALOS_DIR}"
+                ls -1 "${RUNNER_TALOS_DIR}" || true
+                if test -f "${RUNNER_TALOS_DIR}/talosconfig"; then
+                  TALOS_CFG="${RUNNER_TALOS_DIR}/talosconfig"
+                fi
+              elif sudo test -d "${ROOT_TALOS_DIR}"; then
+                echo "[monitor] talos state dir exists: ${ROOT_TALOS_DIR}"
+                sudo ls -1 "${ROOT_TALOS_DIR}" || true
+                if sudo test -f "${ROOT_TALOS_DIR}/talosconfig"; then
+                  TALOS_CFG="${ROOT_TALOS_DIR}/talosconfig"
+                fi
+              else
+                echo "[monitor] talos state dir not created yet"
+              fi
+
+              if [[ -n "${TALOS_CFG}" ]]; then
+                echo "[monitor] talosconfig detected: ${TALOS_CFG}"
+
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" version >/tmp/talos-version-probe.log 2>&1; then
+                  echo "[monitor] talosctl version probe: api reachable"
+                else
+                  VERSION_RC=$?
+                  echo "[monitor] talosctl version probe rc=${VERSION_RC}"
+                  tail -n 1 /tmp/talos-version-probe.log || true
+                fi
+
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" health --wait-timeout 5s >/tmp/talos-health-probe.log 2>&1; then
+                  echo "[monitor] talosctl health probe: healthy"
+                else
+                  HEALTH_RC=$?
+                  echo "[monitor] talosctl health probe rc=${HEALTH_RC}"
+                  tail -n 1 /tmp/talos-health-probe.log || true
+                fi
+              fi
+
+              sleep 20
+            done
+          }
+
+          cleanup_monitor() {
+            if [[ -n "${MONITOR_PID:-}" ]]; then
+              kill "${MONITOR_PID}" >/dev/null 2>&1 || true
+              wait "${MONITOR_PID}" >/dev/null 2>&1 || true
+            fi
+          }
+
+          monitor_talos_create &
+          MONITOR_PID=$!
+          trap cleanup_monitor EXIT
+
           # qemu provisioner requires root privileges on GitHub-hosted Linux
           # runners (CNI + hypervisor setup).
-          sudo -E talosctl cluster create dev \
+          # Guard with an explicit timeout so this step cannot hang forever.
+          set +e
+          timeout --signal=TERM 40m sudo -E talosctl cluster create dev \
             --name          "$CLUSTER_NAME" \
             --provisioner   qemu \
             --controlplanes 1 \
@@ -201,21 +270,44 @@ jobs:
             --config-patch-control-plane @/tmp/mc-patch.yaml \
             --wait \
             --wait-timeout  30m
+          CREATE_RC=$?
+          set -e
+
+          cleanup_monitor
+          trap - EXIT
+
+          if [[ "${CREATE_RC}" -ne 0 ]]; then
+            echo "[FAIL] talosctl cluster create failed with exit code ${CREATE_RC}"
+            echo "[diagnostic] qemu processes:"
+            ps -ef | grep -E "qemu-system|dnsmasq|tap|bridge" | grep -v grep || true
+            echo "[diagnostic] /root/.talos tree (if present):"
+            sudo ls -R /root/.talos || true
+            exit "${CREATE_RC}"
+          fi
 
           # Export configs to workspace paths consumed by later steps.
-          # Since cluster creation runs as root, Talos state is written under
-          # /root/.talos by default.
+          # Depending on sudo HOME behavior, Talos state may land in either
+          # ${HOME}/.talos or /root/.talos.
+          RUNNER_TALOS_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
           ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
-          if [[ ! -f "${ROOT_TALOS_DIR}/talosconfig" ]]; then
-            echo "[FAIL] Expected talosconfig not found at ${ROOT_TALOS_DIR}/talosconfig"
+          if [[ -f "${RUNNER_TALOS_DIR}/talosconfig" ]]; then
+            TALOS_STATE_DIR="${RUNNER_TALOS_DIR}"
+          elif sudo test -f "${ROOT_TALOS_DIR}/talosconfig"; then
+            TALOS_STATE_DIR="${ROOT_TALOS_DIR}"
+          else
+            echo "[FAIL] Expected talosconfig not found in either candidate path"
+            echo "[diagnostic] checked: ${RUNNER_TALOS_DIR}/talosconfig"
+            echo "[diagnostic] checked: ${ROOT_TALOS_DIR}/talosconfig"
             exit 1
           fi
 
-          sudo cp "${ROOT_TALOS_DIR}/talosconfig" "$TALOSCONFIG"
+          echo "[info] using Talos state dir: ${TALOS_STATE_DIR}"
+
+          sudo cp "${TALOS_STATE_DIR}/talosconfig" "$TALOSCONFIG"
           sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
 
           sudo -E talosctl \
-            --talosconfig "${ROOT_TALOS_DIR}/talosconfig" \
+            --talosconfig "${TALOS_STATE_DIR}/talosconfig" \
             kubeconfig --merge=false /tmp/kubeconfig
           sudo cp /tmp/kubeconfig "$KUBECONFIG"
           sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"

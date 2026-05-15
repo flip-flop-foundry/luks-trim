@@ -4,6 +4,10 @@ set -euo pipefail
 WORKFLOW="${1:-Integration Tests}"
 MODE="${2:-inspect}"
 BRANCH="${3:-}"
+POLL_SECS="${GHA_LOOP_POLL_SECS:-15}"
+
+# Force non-interactive output from gh to avoid alternate-buffer TUI behavior.
+export GH_PAGER=cat
 
 usage() {
   cat <<'EOF'
@@ -19,7 +23,10 @@ Examples:
 Modes:
   inspect       Show latest run details and fetch only failed-step logs if present.
   rerun-failed  Re-run only failed jobs for the latest failed run and watch it.
-  watch-latest  Watch latest run live, then print failed logs if it fails.
+  watch-latest  Non-interactive live monitor of latest run (step + status deltas).
+
+Environment:
+  GHA_LOOP_POLL_SECS   Poll interval in seconds for watch mode (default: 15)
 EOF
 }
 
@@ -37,6 +44,12 @@ fi
 if ! gh auth status >/dev/null 2>&1; then
   echo "[ERROR] gh is not authenticated."
   echo "Run: gh auth login"
+  exit 1
+fi
+
+REPO="$(gh repo view --json nameWithOwner --jq '.nameWithOwner')"
+if [[ -z "${REPO}" ]]; then
+  echo "[ERROR] Could not resolve repository from current directory."
   exit 1
 fi
 
@@ -89,10 +102,51 @@ if [[ -z "${run_id}" ]]; then
   exit 1
 fi
 
+run_status() {
+  gh api "repos/${REPO}/actions/runs/${run_id}" --jq '.status'
+}
+
+run_conclusion() {
+  gh api "repos/${REPO}/actions/runs/${run_id}" --jq '.conclusion // ""'
+}
+
+run_url() {
+  gh api "repos/${REPO}/actions/runs/${run_id}" --jq '.html_url'
+}
+
+current_step_name() {
+  gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
+    --jq '[.jobs[]? | .steps[]? | select(.status=="in_progress") | .name][0] // ""'
+}
+
+current_step_started_at() {
+  gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
+    --jq '[.jobs[]? | .steps[]? | select(.status=="in_progress") | .started_at][0] // ""'
+}
+
 print_summary() {
   echo "Workflow : ${WORKFLOW}"
+  echo "Repo     : ${REPO}"
   echo "Run ID   : ${run_id}"
-  gh run view "${run_id}"
+  echo "Status   : $(run_status)"
+  echo "URL      : $(run_url)"
+}
+
+print_live_step_snapshot() {
+  local step
+  local started
+
+  step="$(current_step_name)"
+  started="$(current_step_started_at)"
+
+  if [[ -n "${step}" ]]; then
+    echo "Active step: ${step}"
+    if [[ -n "${started}" ]]; then
+      echo "Step started at: ${started}"
+    fi
+  else
+    echo "Active step: <none>"
+  fi
 }
 
 dump_failed_logs() {
@@ -112,9 +166,50 @@ dump_failed_logs() {
   fi
 }
 
+watch_run_until_complete() {
+  local last_line=""
+
+  echo "Polling every ${POLL_SECS}s"
+  while true; do
+    local status
+    local conclusion
+    local step
+    local step_started
+    local line
+
+    status="$(run_status)"
+    conclusion="$(run_conclusion)"
+    step="$(current_step_name)"
+    step_started="$(current_step_started_at)"
+
+    line="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] status=${status} conclusion=${conclusion:-n/a} step=${step:-none} started=${step_started:-n/a}"
+    if [[ "${line}" != "${last_line}" ]]; then
+      echo "${line}"
+      last_line="${line}"
+    fi
+
+    if [[ "${status}" == "completed" ]]; then
+      break
+    fi
+
+    sleep "${POLL_SECS}"
+  done
+
+  local final_conclusion
+  final_conclusion="$(run_conclusion)"
+  echo "Run conclusion: ${final_conclusion}"
+  if [[ "${final_conclusion}" == "failure" ]]; then
+    dump_failed_logs
+    return 1
+  fi
+
+  return 0
+}
+
 case "${MODE}" in
   inspect)
     print_summary
+    print_live_step_snapshot
     dump_failed_logs
     ;;
   rerun-failed)
@@ -124,24 +219,11 @@ case "${MODE}" in
     gh run rerun "${run_id}" --failed
 
     echo "Watching rerun for run ${run_id}..."
-    gh run watch "${run_id}" --exit-status || true
-
-    final_conclusion=$(gh run view "${run_id}" --json conclusion --jq '.conclusion')
-    echo "Rerun conclusion: ${final_conclusion}"
-    if [[ "${final_conclusion}" == "failure" ]]; then
-      dump_failed_logs
-      exit 1
-    fi
+    watch_run_until_complete
     ;;
   watch-latest)
     print_summary
-    gh run watch "${run_id}" --exit-status || true
-    final_conclusion=$(gh run view "${run_id}" --json conclusion --jq '.conclusion')
-    echo "Run conclusion: ${final_conclusion}"
-    if [[ "${final_conclusion}" == "failure" ]]; then
-      dump_failed_logs
-      exit 1
-    fi
+    watch_run_until_complete
     ;;
   *)
     echo "[ERROR] Unknown mode: ${MODE}"

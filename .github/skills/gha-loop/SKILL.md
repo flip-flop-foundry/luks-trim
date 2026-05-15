@@ -37,6 +37,7 @@ Workspace-local skill for this repository.
   - scripts/gha-loop.sh "Integration Tests" rerun-failed
 - Watch latest run:
   - make gha-watch
+  - make gha-follow
   - scripts/gha-loop.sh "Integration Tests" watch-latest
 - Limit to a branch:
   - scripts/gha-loop.sh "Integration Tests" inspect main
@@ -48,6 +49,24 @@ Workspace-local skill for this repository.
 - Failed-step logs written to:
   - /tmp/gha-failed-<run-id>.log
 - Clear rerun result and final conclusion.
+- Live status deltas while a run is in progress:
+  - status
+  - active step name
+  - active step start time
+
+## Ongoing Execution Monitoring
+
+Use these for in-progress runs:
+
+- make gha-follow
+- scripts/gha-loop.sh "Integration Tests" watch-latest
+
+Behavior:
+
+- Non-interactive polling (no alternate-buffer TUI)
+- Prints only status/step changes to reduce noise
+- Poll interval configurable via environment variable:
+  - GHA_LOOP_POLL_SECS=10 make gha-follow
 
 ## Agent Behavior
 

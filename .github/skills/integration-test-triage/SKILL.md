@@ -26,6 +26,7 @@ This skill is specialized for fast diagnosis and repair of failures in the Integ
 
 1. Inspect latest workflow failure:
    - make gha-inspect
+  - For in-progress execution, use: make gha-follow
 2. Identify first failing step and exact error lines.
 3. Apply smallest targeted patch.
 4. Run local static/syntax checks for changed files.
