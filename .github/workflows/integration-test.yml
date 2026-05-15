@@ -612,7 +612,7 @@ jobs:
             --from-literal=CRYPTO_PBKDF=argon2i
 
           # Per-PVC key secret. Name must match the PVC name for per-PVC lookup tests.
-          kubectl create secret generic luks-pvc-key \
+          kubectl create secret generic t3-pvc-vol \
             --namespace luks-trim-test \
             --from-literal=CRYPTO_KEY_VALUE="${PVC_PASSPHRASE}" \
             --from-literal=CRYPTO_KEY_PROVIDER=secret \
@@ -783,7 +783,7 @@ jobs:
             --set longhorn.globalKey.enabled=true \
             --set longhorn.globalKey.secretName=longhorn-crypto \
             --set longhorn.globalKey.secretNamespace=longhorn-system \
-            --set-json 'longhorn.namespaceSecrets=[{"namespace":"luks-trim-test","secretNames":["luks-ns-shared","luks-pvc-key"]}]' \
+            --set-json 'longhorn.namespaceSecrets=[{"namespace":"luks-trim-test","secretNames":["luks-ns-shared","t3-pvc-vol"]}]' \
             --set talos.enabled=false \
             --set dryRun=false \
             --set 'schedule=0 3 1 1 *'   # dormant; jobs triggered manually
@@ -1326,7 +1326,7 @@ jobs:
           apiVersion: v1
           kind: PersistentVolumeClaim
           metadata:
-            name: luks-pvc-key
+            name: t3-pvc-vol
             namespace: luks-trim-test
           spec:
             accessModes: [ReadWriteOnce]
@@ -1382,7 +1382,7 @@ jobs:
             volumes:
               - name: data
                 persistentVolumeClaim:
-                  claimName: luks-pvc-key
+                  claimName: t3-pvc-vol
             restartPolicy: Never
           ---
           apiVersion: v1
@@ -1411,7 +1411,7 @@ jobs:
 
       - name: "[T3] Assert PVCs are bound across all classes"
         run: |
-          for PVC in test-vol t3-ns-vol luks-pvc-key t3-plain-vol; do
+          for PVC in test-vol t3-ns-vol t3-pvc-vol t3-plain-vol; do
             PHASE=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.status.phase}')
             SC=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.spec.storageClassName}')
             echo "${PVC}: phase=${PHASE} storageClass=${SC}"
