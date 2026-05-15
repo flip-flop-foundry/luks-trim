@@ -753,24 +753,35 @@ jobs:
 
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
 
-          # Wait for the coordinator pod to complete.
-          if ! kubectl wait "job/${JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m; then
-            echo "[FAIL] Coordinator job ${JOB} did not complete within timeout"
-            echo "[diagnostic] coordinator job/pods:"
+          # Poll coordinator progress so we keep seeing job status, logs, and events.
+          COORD_DEADLINE=$(( SECONDS + 300 ))
+          while true; do
+            COORD_SUCCEEDED=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)
+            COORD_FAILED=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+            COORD_ACTIVE=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
+
+            echo "[monitor] coordinator ${JOB}: active=${COORD_ACTIVE:-0} succeeded=${COORD_SUCCEEDED:-0} failed=${COORD_FAILED:-0}"
             kubectl get "job/${JOB}" -n luks-trim -o wide || true
             kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
-            echo "[diagnostic] coordinator pod logs:"
-            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
-            echo "[diagnostic] recent events in luks-trim namespace:"
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
-            exit 1
-          fi
+            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=120 || true
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
 
-          echo "[diagnostic] coordinator pod logs:"
-          kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
-          echo "[diagnostic] recent events in luks-trim namespace:"
-          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            if (( ${COORD_SUCCEEDED:-0} >= 1 )); then
+              break
+            fi
+
+            if (( ${COORD_FAILED:-0} >= 1 )); then
+              echo "[FAIL] Coordinator job ${JOB} failed"
+              exit 1
+            fi
+
+            if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
+              echo "[FAIL] Coordinator job ${JOB} did not complete within timeout"
+              exit 1
+            fi
+
+            sleep 15
+          done
 
           echo "Coordinator complete; waiting for worker Job to appear…"
           # The coordinator creates one worker Job per node. Poll until it
@@ -789,15 +800,35 @@ jobs:
 
           if [[ -z "$WORKER_JOB" ]]; then
             echo "[FAIL] No worker Job appeared within 60 s of coordinator completing"
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
             exit 1
           fi
           echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
           echo "Worker Job: ${WORKER_JOB}"
 
-          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m 2>/dev/null || \
-          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
-            --for=condition=failed --timeout=30s 2>/dev/null || true
+          WORKER_DEADLINE=$(( SECONDS + 300 ))
+          while true; do
+            WORKER_SUCCEEDED=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)
+            WORKER_FAILED=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+            WORKER_ACTIVE=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
+
+            echo "[monitor] worker ${WORKER_JOB}: active=${WORKER_ACTIVE:-0} succeeded=${WORKER_SUCCEEDED:-0} failed=${WORKER_FAILED:-0}"
+            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=120 || true
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+
+            if (( ${WORKER_SUCCEEDED:-0} >= 1 )) || (( ${WORKER_FAILED:-0} >= 1 )); then
+              break
+            fi
+
+            if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
+              echo "[FAIL] Worker job ${WORKER_JOB} did not complete within timeout"
+              exit 1
+            fi
+
+            sleep 15
+          done
 
           echo "[diagnostic] worker job/pods:"
           kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
@@ -908,23 +939,34 @@ jobs:
           echo "job=${JOB}" >> "$GITHUB_OUTPUT"
 
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
-          if ! kubectl wait "job/${JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m; then
-            echo "[FAIL] Dry-run coordinator job ${JOB} did not complete within timeout"
-            echo "[diagnostic] dry-run coordinator job/pods:"
+          COORD_DEADLINE=$(( SECONDS + 300 ))
+          while true; do
+            COORD_SUCCEEDED=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)
+            COORD_FAILED=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+            COORD_ACTIVE=$(kubectl get "job/${JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
+
+            echo "[monitor] dry-run coordinator ${JOB}: active=${COORD_ACTIVE:-0} succeeded=${COORD_SUCCEEDED:-0} failed=${COORD_FAILED:-0}"
             kubectl get "job/${JOB}" -n luks-trim -o wide || true
             kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
-            echo "[diagnostic] dry-run coordinator pod logs:"
-            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
-            echo "[diagnostic] recent events in luks-trim namespace:"
-            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
-            exit 1
-          fi
+            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=120 || true
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
 
-          echo "[diagnostic] dry-run coordinator pod logs:"
-          kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
-          echo "[diagnostic] recent events in luks-trim namespace:"
-          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            if (( ${COORD_SUCCEEDED:-0} >= 1 )); then
+              break
+            fi
+
+            if (( ${COORD_FAILED:-0} >= 1 )); then
+              echo "[FAIL] Dry-run coordinator job ${JOB} failed"
+              exit 1
+            fi
+
+            if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
+              echo "[FAIL] Dry-run coordinator job ${JOB} did not complete within timeout"
+              exit 1
+            fi
+
+            sleep 15
+          done
 
           # Find the worker Job created by this coordinator run.
           DEADLINE=$(( SECONDS + 60 ))
@@ -949,13 +991,35 @@ jobs:
 
           if [[ -z "$WORKER_JOB" ]]; then
             echo "[FAIL] No new worker Job appeared within 60 s"
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
             exit 1
           fi
           echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
           echo "Dry-run worker Job: ${WORKER_JOB}"
 
-          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m 2>/dev/null || true
+          WORKER_DEADLINE=$(( SECONDS + 300 ))
+          while true; do
+            WORKER_SUCCEEDED=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)
+            WORKER_FAILED=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+            WORKER_ACTIVE=$(kubectl get "job/${WORKER_JOB}" -n luks-trim -o jsonpath='{.status.active}' 2>/dev/null || echo 0)
+
+            echo "[monitor] dry-run worker ${WORKER_JOB}: active=${WORKER_ACTIVE:-0} succeeded=${WORKER_SUCCEEDED:-0} failed=${WORKER_FAILED:-0}"
+            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=120 || true
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 50 || true
+
+            if (( ${WORKER_SUCCEEDED:-0} >= 1 )) || (( ${WORKER_FAILED:-0} >= 1 )); then
+              break
+            fi
+
+            if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
+              echo "[FAIL] Dry-run worker job ${WORKER_JOB} did not complete within timeout"
+              exit 1
+            fi
+
+            sleep 15
+          done
 
           echo "[diagnostic] dry-run worker job/pods:"
           kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
