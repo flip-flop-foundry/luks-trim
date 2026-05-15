@@ -9,7 +9,7 @@
 # Key test scenarios
 # ──────────────────
 # T1  Live run  – write 2 GiB → delete → run luks-trim (enables LUKS
-#     allow-discards) → trigger Longhorn filesystem-trim recurring job →
+#     allow-discards) → trigger Longhorn filesystem-trim CronJob →
 #     assert Longhorn actualSize shrank.
 #
 # T2  Dry-run   – verify worker logs contain [dry-run] lines, no [ERROR]
@@ -568,7 +568,8 @@ jobs:
           spec:
             cron: "0 0 1 1 *"
             task: "filesystem-trim"
-            groups: []
+            groups:
+            - default
             retain: 1
             concurrency: 1
             labels: {}
@@ -711,7 +712,7 @@ jobs:
       # 1. Write 2 GiB → assert Longhorn actualSize grew
       # 2. Delete file  → assert actualSize did NOT automatically shrink
       # 3. Run luks-trim cronjob manually
-      # 4. Trigger Longhorn filesystem-trim recurring job
+      # 4. Trigger Longhorn filesystem-trim CronJob manually
       # 5. Assert actualSize shrank (hard fail if < 1 GiB reclaimed)
       # ======================================================================
 
@@ -918,58 +919,31 @@ jobs:
 
           echo "[PASS] Worker pod exited 0; no error lines found"
 
-      - name: "[T1] Trigger Longhorn filesystem-trim recurring job"
+      - name: "[T1] Trigger Longhorn filesystem-trim CronJob"
         run: |
-          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
-          JOB_NAME="ci-filesystem-trim"
+          CRONJOB_NAME="ci-filesystem-trim"
+          TRIGGER_JOB="${CRONJOB_NAME}-manual-$(date +%s)"
 
-          # Attach recurring trim job to this specific Longhorn volume.
-          kubectl -n longhorn-system label volume.longhorn.io "${VOL_NAME}" \
-            recurring-job.longhorn.io/ci-filesystem-trim=enabled --overwrite
-
-          echo "[diagnostic] recurring job labels on ${VOL_NAME}:"
-          kubectl -n longhorn-system get volume.longhorn.io "${VOL_NAME}" \
-            -o jsonpath='{.metadata.labels}' || true
-          echo
-
-          BASE_EXEC=$(kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" \
-            -o jsonpath='{.status.executionCount}' 2>/dev/null || true)
-          echo "[diagnostic] ${JOB_NAME} executionCount before trigger: ${BASE_EXEC:-<unset>}"
-
-          # Trigger now by temporarily switching cron to every minute.
-          kubectl -n longhorn-system patch recurringjobs.longhorn.io "${JOB_NAME}" \
-            --type=merge -p '{"spec":{"cron":"* * * * *"}}'
-
-          TRIGGERED=0
-          if [[ -n "${BASE_EXEC}" ]]; then
-            echo "[diagnostic] waiting for ${JOB_NAME} executionCount to increase"
-            DEADLINE=$((SECONDS + 180))
-            while [[ $SECONDS -lt $DEADLINE ]]; do
-              CUR_EXEC=$(kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" \
-                -o jsonpath='{.status.executionCount}' 2>/dev/null || true)
-              echo "[diagnostic] current executionCount=${CUR_EXEC:-<unset>}"
-              if [[ -n "${CUR_EXEC}" ]] && [[ "${CUR_EXEC}" -gt "${BASE_EXEC}" ]]; then
-                TRIGGERED=1
-                break
-              fi
-              sleep 10
-            done
-          else
-            # Older Longhorn versions may not expose executionCount.
-            sleep 75
-            TRIGGERED=1
+          if ! kubectl -n longhorn-system get cronjob "${CRONJOB_NAME}" >/dev/null 2>&1; then
+            echo "[FAIL] Expected Longhorn CronJob ${CRONJOB_NAME} was not found"
+            echo "[diagnostic] available CronJobs in longhorn-system:"
+            kubectl -n longhorn-system get cronjobs || true
+            exit 1
           fi
 
-          # Return job to dormant schedule so it does not interfere with T2.
-          kubectl -n longhorn-system patch recurringjobs.longhorn.io "${JOB_NAME}" \
-            --type=merge -p '{"spec":{"cron":"0 0 1 1 *"}}'
+          kubectl -n longhorn-system create job "${TRIGGER_JOB}" --from=cronjob/"${CRONJOB_NAME}"
 
-          if [[ "${TRIGGERED}" -ne 1 ]]; then
-            echo "[FAIL] ${JOB_NAME} did not execute within timeout"
-            kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" -o yaml || true
+          if ! kubectl -n longhorn-system wait --for=condition=complete "job/${TRIGGER_JOB}" --timeout=5m; then
+            echo "[FAIL] Triggered Longhorn trim job ${TRIGGER_JOB} did not complete"
+            kubectl -n longhorn-system get "job/${TRIGGER_JOB}" -o wide || true
+            kubectl -n longhorn-system get pods -l "job-name=${TRIGGER_JOB}" -o wide || true
+            kubectl -n longhorn-system logs -l "job-name=${TRIGGER_JOB}" --tail=-1 || true
             kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 120 || true
             exit 1
           fi
+
+          echo "[diagnostic] Longhorn trim trigger job logs:"
+          kubectl -n longhorn-system logs -l "job-name=${TRIGGER_JOB}" --tail=-1 || true
 
           echo "[diagnostic] recent longhorn events after trim trigger:"
           kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 60 || true
