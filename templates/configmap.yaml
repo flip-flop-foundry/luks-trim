@@ -228,6 +228,7 @@ data:
       done
       if [ "$_failed" -gt 0 ]; then
         echo "  [ERROR] $_failed Longhorn volume(s) could not be unlocked. Check key configuration."
+        return 1
       fi
     }
     {{- end }}
@@ -324,6 +325,7 @@ data:
       $_found || echo "  No /dev/mapper/luks2-* devices on this node"
       if [ "$_failed" -gt 0 ]; then
         echo "  [ERROR] $_failed Talos volume(s) failed. Check KMS connectivity and LUKS2 headers."
+        return 1
       fi
     }
     {{- end }}

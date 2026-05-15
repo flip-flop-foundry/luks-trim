@@ -141,7 +141,7 @@ longhorn:
 # Talos system volume processing
 # ---------------------------------------------------------------------------
 talos:
-  enabled: true
+  enabled: false
 
   # gRPC endpoint of the Talos KMS server used to unseal LUKS2 volume keys.
   # Required when talos.enabled is true.

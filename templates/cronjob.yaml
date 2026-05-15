@@ -105,6 +105,7 @@ spec:
                   # Build excluded-nodes lookup (newline-separated list baked in at render time).
                   EXCLUDED_NODES={{ if .Values.excludedNodes }}{{ join "\n" .Values.excludedNodes | quote }}{{ else }}""{{ end }}
 
+                  _submit_failed=0
                   for NODE in $ALL_NODES; do
                     # Apply excludedNodes denylist.
                     if printf '%s' "$EXCLUDED_NODES" | grep -qxF "$NODE"; then
@@ -118,6 +119,8 @@ spec:
 
                     TOLERATIONS_JSON={{ .Values.tolerations | toJson | squote }}
                     WORKER_RESOURCES_JSON={{ .Values.workerResources | toJson | squote }}
+                    IMAGE_PULL_SECRETS_JSON={{ .Values.imagePullSecrets | toJson | squote }}
+                    POD_ANNOTATIONS_JSON={{ .Values.podAnnotations | toJson | squote }}
 
                     JOB_SPEC=$(jq -n \
                       --arg name       "$JOB_NAME" \
@@ -140,6 +143,8 @@ spec:
                       --arg dr         "$DRY_RUN" \
                       --argjson tols   "$TOLERATIONS_JSON" \
                       --argjson res    "$WORKER_RESOURCES_JSON" \
+                      --argjson ips    "$IMAGE_PULL_SECRETS_JSON" \
+                      --argjson anns   "$POD_ANNOTATIONS_JSON" \
                       '{
                         apiVersion: "batch/v1",
                         kind: "Job",
@@ -162,7 +167,8 @@ spec:
                                 "app.kubernetes.io/name": "luks-trim",
                                 "luks-trim/role": "worker",
                                 "luks-trim/node": $node
-                              }
+                              },
+                              annotations: (if $anns | length > 0 then $anns else null end)
                             },
                             spec: {
                               nodeName: $node,
@@ -170,6 +176,7 @@ spec:
                               hostPID: true,
                               restartPolicy: "Never",
                               tolerations: $tols,
+                              imagePullSecrets: (if $ips | length > 0 then $ips else null end),
                               containers: [{
                                 name: "luks-trim",
                                 image: $image,
@@ -211,7 +218,11 @@ spec:
                       -d "$JOB_SPEC" \
                       "$KUBE_API/apis/batch/v1/namespaces/$CHART_NAMESPACE/jobs" \
                       && echo "    Created" \
-                      || echo "    [warn] Job creation failed for $NODE"
+                      || { echo "    [ERROR] Job creation failed for $NODE"; _submit_failed=$(( _submit_failed + 1 )); }
                   done
 
+                  if [ "$_submit_failed" -gt 0 ]; then
+                    echo "[ERROR] $_submit_failed per-node Job(s) failed to submit. Affected nodes did not run trim."
+                    exit 1
+                  fi
                   echo "$(date) - All per-node Jobs submitted. Workers self-delete after ${WORKER_TTL}s."

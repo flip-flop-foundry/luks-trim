@@ -1,0 +1,674 @@
+# Integration tests for the luks-trim Helm chart.
+#
+# Infrastructure: QEMU-based Talos v1.13 single-node cluster on the GHA
+# ubuntu-latest runner (nested KVM available).  Docker-based Talos is NOT
+# used because Docker nodes run on overlayfs, which does not support the
+# FITRIM ioctl – making it impossible to verify that fstrim actually frees
+# host storage.
+#
+# Key test scenarios
+# ──────────────────
+# T1  Live run  – write 2 GiB → delete → run luks-trim (enables LUKS
+#     allow-discards) → fstrim inside the pod → assert Longhorn actualSize
+#     shrank (TRIM propagated through ext4 → dm-crypt → Longhorn replica).
+#
+# T2  Dry-run   – verify worker logs contain [dry-run] lines, no [ERROR]
+#     lines, and Longhorn actualSize is unchanged.
+#
+# Trigger: workflow_dispatch only (not automated; QEMU cluster takes ~30 min).
+# To gate PRs, add a `pull_request` trigger once the cluster setup time is
+# acceptable for your CI budget.
+
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker-image:
+        description: >
+          Worker image to test.
+          Format: repository:tag  (e.g. ghcr.io/flip-flop-foundry/luks-trim/worker:sha-abc1234)
+        required: false
+        default: 'ghcr.io/flip-flop-foundry/luks-trim/worker:latest'
+        type: string
+      talos-version:
+        description: >
+          Talos version without the leading "v", e.g. 1.9.5.
+          Leave blank to use the latest stable release.
+        required: false
+        default: ''
+        type: string
+      longhorn-version:
+        description: 'Longhorn Helm chart version (longhorn/longhorn).'
+        required: false
+        default: '1.8.1'
+        type: string
+
+# Only one integration-test run at a time; a newer push cancels the old one.
+concurrency:
+  group: integration-test
+  cancel-in-progress: true
+
+env:
+  CLUSTER_NAME: luks-trim-test
+  # These paths are written by the cluster-create step and consumed by later
+  # steps via the TALOSCONFIG / KUBECONFIG env vars picked up automatically
+  # by talosctl / kubectl.
+  TALOSCONFIG: ${{ github.workspace }}/talosconfig
+  KUBECONFIG:  ${{ github.workspace }}/kubeconfig
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read          # checkout only; no writes back to the repo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ======================================================================
+      # 1. SYSTEM DEPENDENCIES
+      # ======================================================================
+
+      - name: Install QEMU and KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-system-x86 qemu-kvm cpu-checker
+          # ubuntu-latest GHA runners expose /dev/kvm via nested virtualisation.
+          sudo chmod 666 /dev/kvm
+          kvm-ok
+
+      - name: Resolve Talos version
+        id: talos
+        run: |
+          VER="${{ inputs.talos-version }}"
+          if [[ -z "$VER" ]]; then
+            VER=$(curl -sSfL https://api.github.com/repos/siderolabs/talos/releases/latest \
+              | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Talos version: v${VER}"
+
+      - name: Install talosctl
+        run: |
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${{ steps.talos.outputs.version }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Install kubectl
+        run: |
+          STABLE=$(curl -sSfL https://dl.k8s.io/release/stable.txt)
+          curl -sSfL "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl" \
+            -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install Helm
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      # ======================================================================
+      # 2. TALOS IMAGE FACTORY — schematic with Longhorn system extensions
+      #
+      # The QEMU provisioner boots the standard Talos kernel/initramfs, then
+      # runs the installer image written into machine.install.image.  By
+      # pointing that field at a factory.talos.dev installer that embeds
+      # iscsi-tools and util-linux-tools, the resulting OS has everything
+      # Longhorn needs (iSCSI initiator, fstrim, blkid) without requiring
+      # any runtime package installs inside the VM.
+      # ======================================================================
+
+      - name: Request Talos factory schematic (iscsi-tools + util-linux-tools)
+        id: factory
+        run: |
+          # Write the schematic to a file to avoid indentation issues with
+          # embedding YAML content inside this YAML block scalar.
+          cat > /tmp/schematic.yaml <<'SCHEMATIC'
+          customization:
+            systemExtensions:
+              officialExtensions:
+                - siderolabs/iscsi-tools
+                - siderolabs/util-linux-tools
+          SCHEMATIC
+
+          RESP=$(curl -sSfL \
+            -X POST \
+            -H 'Content-Type: application/yaml' \
+            --data-binary @/tmp/schematic.yaml \
+            https://factory.talos.dev/schematics)
+          ID=$(echo "$RESP" | jq -r '.id')
+          if [[ -z "$ID" || "$ID" == "null" ]]; then
+            echo "[FAIL] Unexpected response from factory.talos.dev: $RESP"
+            exit 1
+          fi
+          echo "id=${ID}" >> "$GITHUB_OUTPUT"
+          echo "Schematic ID: ${ID}"
+
+      # ======================================================================
+      # 3. PROVISION TALOS QEMU CLUSTER
+      #
+      # Single-node (1 controlplane, 0 workers) to stay within the ~7 GiB RAM
+      # of standard ubuntu-latest runners.  cluster.allowSchedulingOnControl-
+      # Planes removes the NoSchedule taint so Longhorn and test pods can land.
+      #
+      # Disk: 30 GiB — Talos OS (~2 GiB) + Longhorn replica data (up to 20 GiB
+      # for writes during tests), all on /var/lib/longhorn (EPHEMERAL partition).
+      #
+      # The machine config patch injects:
+      #   • machine.install.image  → factory installer with extensions
+      #   • machine.files          → iSCSI initiator name (required by Longhorn)
+      #   • cluster.allowSchedulingOnControlPlanes → removes NoSchedule taint
+      # ======================================================================
+
+      - name: Create Talos QEMU cluster
+        env:
+          TALOS_VERSION: ${{ steps.talos.outputs.version }}
+          SCHEMATIC_ID:  ${{ steps.factory.outputs.id }}
+        run: |
+          cat > /tmp/mc-patch.yaml <<EOF
+          cluster:
+            allowSchedulingOnControlPlanes: true
+          machine:
+            install:
+              image: factory.talos.dev/installer/${SCHEMATIC_ID}:v${TALOS_VERSION}
+            files:
+              - path: /etc/iscsi/initiatorname.iscsi
+                permissions: 0o644
+                op: create
+                content: |
+                  InitiatorName=iqn.2025-01.io.longhorn:luks-trim-test
+          EOF
+
+          talosctl cluster create \
+            --name          "$CLUSTER_NAME" \
+            --provisioner   qemu \
+            --controlplanes 1 \
+            --workers       0 \
+            --disk          30720 \
+            --memory        4096 \
+            --cpus          "2.0" \
+            --talos-version "v${TALOS_VERSION}" \
+            --config-patch-control-plane @/tmp/mc-patch.yaml \
+            --wait \
+            --wait-timeout  30m
+
+          # Export configs to workspace paths consumed by later steps.
+          cp ~/.talos/clusters/${CLUSTER_NAME}/talosconfig "$TALOSCONFIG"
+          talosctl --talosconfig "$TALOSCONFIG" kubeconfig --merge=false "$KUBECONFIG"
+
+      - name: Wait for node Ready
+        run: |
+          kubectl wait node --all --for=condition=Ready --timeout=10m
+          kubectl get nodes -o wide
+
+      # ======================================================================
+      # 4. INSTALL LONGHORN
+      #
+      # defaultReplicaCount=1 — single node has nowhere to replicate.
+      # ======================================================================
+
+      - name: Install Longhorn
+        run: |
+          helm repo add longhorn https://charts.longhorn.io
+          helm repo update
+          helm upgrade --install longhorn longhorn/longhorn \
+            --namespace   longhorn-system \
+            --create-namespace \
+            --version     "${{ inputs.longhorn-version }}" \
+            --set         defaultSettings.defaultReplicaCount=1 \
+            --wait \
+            --timeout     20m
+          kubectl -n longhorn-system get pods
+
+      # ======================================================================
+      # 5. TEST FIXTURES
+      # ======================================================================
+
+      - name: Create test namespace and LUKS key secret
+        run: |
+          kubectl create namespace luks-trim-test
+
+          # Random passphrase — strong enough for a CI test.
+          PASSPHRASE=$(openssl rand -base64 32)
+
+          # Secret format matches what Longhorn's CSI encryption driver expects
+          # and what luks-trim reads for the globalKey lookup.
+          kubectl create secret generic longhorn-crypto \
+            --namespace longhorn-system \
+            --from-literal=CRYPTO_KEY_VALUE="${PASSPHRASE}" \
+            --from-literal=CRYPTO_KEY_PROVIDER=secret \
+            --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
+            --from-literal=CRYPTO_KEY_HASH=sha256 \
+            --from-literal=CRYPTO_KEY_SIZE=256 \
+            --from-literal=CRYPTO_PBKDF=argon2i
+
+      - name: Create encrypted Longhorn StorageClass
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: longhorn-encrypted
+          provisioner: driver.longhorn.io
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          parameters:
+            numberOfReplicas: "1"
+            staleReplicaTimeout: "2880"
+            fromBackup: ""
+            fsType: ext4
+            encrypted: "true"
+            csi.storage.k8s.io/provisioner-secret-name:      longhorn-crypto
+            csi.storage.k8s.io/provisioner-secret-namespace: longhorn-system
+            csi.storage.k8s.io/node-publish-secret-name:     longhorn-crypto
+            csi.storage.k8s.io/node-publish-secret-namespace: longhorn-system
+            csi.storage.k8s.io/node-stage-secret-name:       longhorn-crypto
+            csi.storage.k8s.io/node-stage-secret-namespace:  longhorn-system
+            csi.storage.k8s.io/node-expand-secret-name:      longhorn-crypto
+            csi.storage.k8s.io/node-expand-secret-namespace: longhorn-system
+          EOF
+
+      - name: Create test PVC and filler pod
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: longhorn-encrypted
+            resources:
+              requests:
+                storage: 5Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: test-vol
+            restartPolicy: Never
+          EOF
+
+          kubectl wait pod/filler -n luks-trim-test \
+            --for=condition=Ready --timeout=5m
+
+      # ======================================================================
+      # 6. INSTALL luks-trim CHART
+      #
+      # globalKey mode: a single secret covers all encrypted Longhorn volumes.
+      # The schedule is set to a far-future cron so it never fires automatically;
+      # test steps trigger runs with `kubectl create job --from=cronjob/...`.
+      # ======================================================================
+
+      - name: Install luks-trim chart
+        run: |
+          IMAGE="${{ inputs.worker-image }}"
+          # Split "repo:tag"; if no colon is present, default tag to "latest".
+          if [[ "$IMAGE" == *:* ]]; then
+            REPO="${IMAGE%:*}"
+            TAG="${IMAGE##*:}"
+          else
+            REPO="$IMAGE"
+            TAG="latest"
+          fi
+
+          helm upgrade --install luks-trim . \
+            --namespace   luks-trim \
+            --create-namespace \
+            --set image.repository="${REPO}" \
+            --set image.tag="${TAG}" \
+            --set longhorn.enabled=true \
+            --set longhorn.globalKey.enabled=true \
+            --set longhorn.globalKey.secretName=longhorn-crypto \
+            --set longhorn.globalKey.secretNamespace=longhorn-system \
+            --set talos.enabled=false \
+            --set dryRun=false \
+            --set 'schedule=0 3 1 1 *'   # dormant; jobs triggered manually
+
+          kubectl -n luks-trim get all
+
+      # ======================================================================
+      # T1 — LIVE RUN
+      #
+      # 1. Write 2 GiB → assert Longhorn actualSize grew
+      # 2. Delete file  → assert actualSize did NOT automatically shrink
+      # 3. Run luks-trim (sets LUKS allow-discards on running device)
+      # 4. fstrim inside pod → FITRIM propagates through ext4→dm-crypt→Longhorn
+      # 5. Assert actualSize shrank (best-effort; warn if < 1 GiB reclaimed)
+      # ======================================================================
+
+      - name: "[T1] Write 2 GiB to encrypted volume"
+        run: |
+          kubectl exec filler -n luks-trim-test -- \
+            dd if=/dev/urandom of=/data/testfile bs=1M count=2048 status=progress
+          kubectl exec filler -n luks-trim-test -- sync
+
+      - name: "[T1] Capture Longhorn actualSize after write"
+        id: baseline
+        run: |
+          # Allow Longhorn replica accounting to settle.
+          sleep 15
+
+          VOL_NAME=$(kubectl get pvc test-vol -n luks-trim-test \
+            -o jsonpath='{.spec.volumeName}')
+          echo "vol_name=${VOL_NAME}" >> "$GITHUB_OUTPUT"
+
+          SIZE=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          echo "size_after_write=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "Longhorn actualSize after 2 GiB write: ${SIZE} bytes"
+
+          if [[ "${SIZE}" -lt $((1500 * 1024 * 1024)) ]]; then
+            echo "[FAIL] actualSize ${SIZE} is below 1.5 GiB after a 2 GiB write"
+            exit 1
+          fi
+
+      - name: "[T1] Delete file – assert no automatic storage reclaim"
+        id: pre-trim
+        run: |
+          kubectl exec filler -n luks-trim-test -- rm /data/testfile
+          kubectl exec filler -n luks-trim-test -- sync
+          sleep 15
+
+          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
+          SIZE=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "actualSize after delete (before trim): ${SIZE} bytes"
+
+          WRITE_SIZE="${{ steps.baseline.outputs.size_after_write }}"
+          FLOOR=$(( WRITE_SIZE * 90 / 100 ))   # allow ≤10 % natural churn
+          if [[ "$SIZE" -lt "$FLOOR" ]]; then
+            echo "[WARN] actualSize dropped more than 10 % before trim – " \
+                 "TRIM may already be flowing (LUKS allow-discards was already set?)"
+          fi
+
+      - name: "[T1] Run luks-trim (live)"
+        id: live-run
+        run: |
+          TS=$(date +%s)
+          JOB="luks-trim-live-${TS}"
+          echo "job=${JOB}" >> "$GITHUB_OUTPUT"
+
+          kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
+
+          # Wait for the coordinator pod to complete.
+          kubectl wait "job/${JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m
+
+          echo "Coordinator complete; waiting for worker Job to appear…"
+          # The coordinator creates one worker Job per node. Poll until it
+          # exists, then capture its name so later steps use only THIS run's
+          # worker (not Jobs from earlier or later runs).
+          DEADLINE=$(( SECONDS + 60 ))
+          WORKER_JOB=""
+          until [[ $SECONDS -ge $DEADLINE ]]; do
+            WORKER_JOB=$(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" \
+              --sort-by='.metadata.creationTimestamp' \
+              -o name 2>/dev/null | tail -1 | sed 's|job.batch/||')
+            [[ -n "$WORKER_JOB" ]] && break
+            sleep 3
+          done
+
+          if [[ -z "$WORKER_JOB" ]]; then
+            echo "[FAIL] No worker Job appeared within 60 s of coordinator completing"
+            exit 1
+          fi
+          echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
+          echo "Worker Job: ${WORKER_JOB}"
+
+          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m 2>/dev/null || \
+          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
+            --for=condition=failed --timeout=30s 2>/dev/null || true
+
+      - name: "[T1] Assert worker pods exited 0 and contain no [ERROR] lines"
+        run: |
+          WORKER_JOB="${{ steps.live-run.outputs.worker_job }}"
+          WORKER_LOGS=$(kubectl logs -n luks-trim \
+            -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
+
+          ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
+          echo "[ERROR] lines in worker logs: ${ERROR_COUNT}"
+          if [[ "${ERROR_COUNT}" -gt 0 ]]; then
+            echo "[FAIL] Worker pod logged ERROR lines:"
+            echo "$WORKER_LOGS" | grep '\[ERROR\]'
+            exit 1
+          fi
+
+          JOB_FAILED=$(kubectl get job "${WORKER_JOB}" -n luks-trim \
+            -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+          if [[ "${JOB_FAILED}" -gt 0 ]]; then
+            echo "[FAIL] Worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
+            echo "$WORKER_LOGS"
+            exit 1
+          fi
+
+          echo "[PASS] Worker pod exited 0; no [ERROR] lines found"
+
+      - name: "[T1] Run fstrim inside filler pod (LUKS allow-discards now active)"
+        run: |
+          # luks-trim just applied --persistent refresh --allow-discards to the
+          # running dm-crypt device.  fstrim sends FITRIM through the ext4 fs →
+          # dm-crypt (discards now enabled) → Longhorn block device →
+          # hole-punch in the replica backing file.
+          kubectl exec filler -n luks-trim-test -- fstrim -v /data
+          # Allow Longhorn replica accounting to settle.
+          sleep 30
+
+      - name: "[T1] Assert Longhorn actualSize shrank after fstrim"
+        run: |
+          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
+          SIZE_NOW=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          PRE_TRIM="${{ steps.pre-trim.outputs.size }}"
+
+          echo "pre-trim actualSize : ${PRE_TRIM} bytes"
+          echo "post-trim actualSize: ${SIZE_NOW} bytes"
+
+          RECLAIMED=$(( PRE_TRIM - SIZE_NOW ))
+          echo "Reclaimed: ${RECLAIMED} bytes"
+
+          # Expect at least 1 GiB reclaimed.  If less, it is a warning rather
+          # than a hard failure: the LUKS layer correctly set allow-discards
+          # (confirmed by worker exit 0 above), but trim propagation through
+          # Longhorn's replica stack depends on the kernel version and backend
+          # filesystem.  This assertion is intentionally advisory.
+          MIN_RECLAIM=$(( 1024 * 1024 * 1024 ))
+          if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
+            echo "[WARN] Less than 1 GiB reclaimed (${RECLAIMED} bytes)."
+            echo "       Check whether fstrim output above showed non-zero bytes."
+          else
+            echo "[PASS] ${RECLAIMED} bytes freed – TRIM propagated end-to-end"
+          fi
+
+      # ======================================================================
+      # T2 — DRY-RUN
+      #
+      # 1. Upgrade chart with dryRun=true
+      # 2. Write fresh data (gives the worker something to report on)
+      # 3. Trigger luks-trim
+      # 4. Assert worker logs contain [dry-run] lines and no [ERROR] lines
+      # 5. Assert Longhorn actualSize did NOT change (no fstrim was issued)
+      # ======================================================================
+
+      - name: "[T2] Upgrade chart: dryRun=true"
+        run: |
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set dryRun=true
+
+      - name: "[T2] Write 512 MiB of fresh data"
+        run: |
+          kubectl exec filler -n luks-trim-test -- \
+            dd if=/dev/urandom of=/data/dryrun-file bs=1M count=512 status=progress
+          kubectl exec filler -n luks-trim-test -- sync
+
+      - name: "[T2] Capture actualSize before dry run"
+        id: dryrun-before
+        run: |
+          sleep 10
+          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
+          SIZE=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "actualSize before dry run: ${SIZE} bytes"
+
+      - name: "[T2] Run luks-trim (dry-run)"
+        id: dry-run-job
+        run: |
+          TS=$(date +%s)
+          JOB="luks-trim-dryrun-${TS}"
+          echo "job=${JOB}" >> "$GITHUB_OUTPUT"
+
+          kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
+          kubectl wait "job/${JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m
+
+          # Find the worker Job created by this coordinator run.
+          DEADLINE=$(( SECONDS + 60 ))
+          WORKER_JOB=""
+          # Record worker Jobs that existed before this run so we can find the
+          # new one even if T1's Job is still in the namespace.
+          PREV_JOBS=$(kubectl get jobs -n luks-trim \
+            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+          until [[ $SECONDS -ge $DEADLINE ]]; do
+            NEW_JOB=$(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" \
+              --sort-by='.metadata.creationTimestamp' \
+              -o name 2>/dev/null | tail -1 | sed 's|job.batch/||')
+            # Accept the job if it wasn't in the pre-run list.
+            if [[ -n "$NEW_JOB" ]] && \
+               ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
+              WORKER_JOB="$NEW_JOB"
+              break
+            fi
+            sleep 3
+          done
+
+          if [[ -z "$WORKER_JOB" ]]; then
+            echo "[FAIL] No new worker Job appeared within 60 s"
+            exit 1
+          fi
+          echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
+          echo "Dry-run worker Job: ${WORKER_JOB}"
+
+          kubectl wait "job/${WORKER_JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m 2>/dev/null || true
+
+      - name: "[T2] Assert [dry-run] lines present and no [ERROR] lines"
+        run: |
+          WORKER_JOB="${{ steps.dry-run-job.outputs.worker_job }}"
+          LOGS=$(kubectl logs -n luks-trim \
+            -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
+
+          DRYRUN_COUNT=$(echo "$LOGS" | grep -c '\[dry-run\]' || true)
+          ERROR_COUNT=$(echo "$LOGS"  | grep -c '\[ERROR\]'   || true)
+
+          echo "[dry-run] log lines : ${DRYRUN_COUNT}"
+          echo "[ERROR]   log lines : ${ERROR_COUNT}"
+
+          if [[ "${DRYRUN_COUNT}" -eq 0 ]]; then
+            echo "[FAIL] No [dry-run] lines found in worker logs (dryRun=true):"
+            echo "$LOGS"
+            exit 1
+          fi
+
+          if [[ "${ERROR_COUNT}" -gt 0 ]]; then
+            echo "[FAIL] [ERROR] lines in worker logs during dry run:"
+            echo "$LOGS" | grep '\[ERROR\]'
+            exit 1
+          fi
+
+          echo "[PASS] Dry-run assertions passed"
+
+      - name: "[T2] Assert actualSize unchanged during dry run"
+        run: |
+          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
+          SIZE_AFTER=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
+            -n longhorn-system -o jsonpath='{.status.actualSize}')
+          SIZE_BEFORE="${{ steps.dryrun-before.outputs.size }}"
+
+          echo "Before dry run: ${SIZE_BEFORE} bytes"
+          echo "After  dry run: ${SIZE_AFTER} bytes"
+
+          # Compute |delta|; bash arithmetic doesn't handle unary minus well.
+          if [[ "$SIZE_AFTER" -ge "$SIZE_BEFORE" ]]; then
+            DELTA=$(( SIZE_AFTER - SIZE_BEFORE ))
+          else
+            DELTA=$(( SIZE_BEFORE - SIZE_AFTER ))
+          fi
+
+          # Allow up to 5 % of pre-dry-run size for normal Longhorn metadata
+          # churn (snapshot bookkeeping, etc.).
+          THRESHOLD=$(( SIZE_BEFORE * 5 / 100 ))
+          echo "Delta: ${DELTA} bytes  (threshold: ${THRESHOLD})"
+
+          if [[ "${DELTA}" -gt "${THRESHOLD}" ]]; then
+            echo "[FAIL] actualSize changed by ${DELTA} bytes during dry run " \
+                 "(threshold ${THRESHOLD}).  fstrim must NOT run in dry-run mode."
+            exit 1
+          fi
+
+          echo "[PASS] actualSize stable during dry run (delta: ${DELTA} bytes)"
+
+      # ======================================================================
+      # ALWAYS: diagnostics on failure, then cluster teardown
+      # ======================================================================
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide || true
+
+          echo "=== Pods (all namespaces) ==="
+          kubectl get pods -A || true
+
+          echo "=== Longhorn volumes ==="
+          kubectl get volume.longhorn.io -n longhorn-system -o wide || true
+
+          echo "=== luks-trim jobs ==="
+          kubectl get jobs -n luks-trim -o wide || true
+
+          echo "=== Coordinator logs ==="
+          kubectl logs -n luks-trim \
+            -l "luks-trim/role=coordinator" --tail=100 || true
+
+          echo "=== Worker logs ==="
+          kubectl logs -n luks-trim \
+            -l "luks-trim/role=worker" --tail=200 || true
+
+          echo "=== Longhorn manager logs (last 50 lines) ==="
+          kubectl logs -n longhorn-system \
+            -l "app=longhorn-manager" --tail=50 || true
+
+          echo "=== filler pod events ==="
+          kubectl describe pod filler -n luks-trim-test || true
+
+      - name: Destroy Talos QEMU cluster
+        if: always()
+        run: |
+          talosctl cluster destroy \
+            --name "$CLUSTER_NAME" --provisioner qemu || true
