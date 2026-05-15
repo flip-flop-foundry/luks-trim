@@ -159,8 +159,8 @@ jobs:
       # of standard ubuntu-latest runners.  cluster.allowSchedulingOnControl-
       # Planes removes the NoSchedule taint so Longhorn and test pods can land.
       #
-      # Disk: 30 GiB — Talos OS (~2 GiB) + Longhorn replica data (up to 20 GiB
-      # for writes during tests), all on /var/lib/longhorn (EPHEMERAL partition).
+      # Disk: runner-capacity-aware. We size based on current free space under
+      # ${HOME} to avoid qemu preallocation failures on busy ubuntu-latest hosts.
       #
       # The machine config patch injects:
       #   • machine.install.image  → factory installer with extensions
@@ -187,6 +187,31 @@ jobs:
                   InitiatorName=iqn.2025-01.io.longhorn:luks-trim-test
           EOF
 
+          AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
+          if [[ -z "${AVAILABLE_MIB}" ]]; then
+            echo "[FAIL] Could not determine free disk space under $HOME"
+            exit 1
+          fi
+
+          RESERVED_MIB=4096
+          MIN_DISK_MIB=8192
+          MAX_DISK_MIB=20480
+          TALOS_DISK_MIB=$(( AVAILABLE_MIB - RESERVED_MIB ))
+
+          if (( TALOS_DISK_MIB > MAX_DISK_MIB )); then
+            TALOS_DISK_MIB=$MAX_DISK_MIB
+          fi
+
+          if (( TALOS_DISK_MIB < MIN_DISK_MIB )); then
+            echo "[FAIL] Not enough free disk for Talos VM preallocation"
+            echo "[diagnostic] available=${AVAILABLE_MIB}MiB reserved=${RESERVED_MIB}MiB required_min=${MIN_DISK_MIB}MiB"
+            df -h "$HOME" || true
+            exit 1
+          fi
+
+          echo "[info] host free space under $HOME: ${AVAILABLE_MIB}MiB"
+          echo "[info] selected Talos disk size: ${TALOS_DISK_MIB}MiB"
+
           # GitHub Actions doesn't support running steps in parallel within
           # the same job, so we run a background heartbeat while Talos creates
           # the cluster. This prevents long periods of silent logs.
@@ -199,6 +224,9 @@ jobs:
 
               QEMU_COUNT=$(pgrep -fc qemu-system || true)
               echo "[monitor] qemu-system process count: ${QEMU_COUNT}"
+
+              FREE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
+              echo "[monitor] host free space under $HOME: ${FREE_MIB:-unknown}MiB"
 
               RUNNER_TALOS_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
               ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
@@ -263,7 +291,7 @@ jobs:
             --provisioner   qemu \
             --controlplanes 1 \
             --workers       0 \
-            --disk          30720 \
+            --disk          "${TALOS_DISK_MIB}" \
             --memory        4096 \
             --cpus          "2.0" \
             --talos-version "v${TALOS_VERSION}" \
