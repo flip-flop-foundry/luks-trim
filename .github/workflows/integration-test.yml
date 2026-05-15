@@ -487,6 +487,14 @@ jobs:
           helm repo add longhorn https://charts.longhorn.io
           helm repo update
 
+            # Longhorn components require privileged pod security context.
+            kubectl create namespace longhorn-system --dry-run=client -o yaml | kubectl apply -f -
+            kubectl label namespace longhorn-system \
+              pod-security.kubernetes.io/enforce=privileged \
+              pod-security.kubernetes.io/audit=privileged \
+              pod-security.kubernetes.io/warn=privileged \
+              --overwrite
+
           if [[ -n "$REQUESTED_VERSION" ]]; then
             LONGHORN_VERSION="$REQUESTED_VERSION"
             echo "Longhorn version source: workflow input"
@@ -502,13 +510,40 @@ jobs:
           echo "Installing Longhorn chart version: ${LONGHORN_VERSION}"
           echo "version=${LONGHORN_VERSION}" >> "$GITHUB_OUTPUT"
 
-          helm upgrade --install longhorn longhorn/longhorn \
+            set +e
+            helm upgrade --install longhorn longhorn/longhorn \
             --namespace   longhorn-system \
-            --create-namespace \
             --version     "${LONGHORN_VERSION}" \
             --set         defaultSettings.defaultReplicaCount=1 \
             --wait \
-            --timeout     20m
+              --timeout     20m >/tmp/longhorn-install.log 2>&1 &
+            LONGHORN_HELM_PID=$!
+
+            while kill -0 "${LONGHORN_HELM_PID}" >/dev/null 2>&1; do
+              echo "[monitor] $(date -u +%Y-%m-%dT%H:%M:%SZ) longhorn install in progress"
+              echo "[monitor] longhorn pods:"
+              kubectl -n longhorn-system get pods -o wide || true
+              echo "[monitor] longhorn deployments:"
+              kubectl -n longhorn-system get deploy || true
+              echo "[monitor] longhorn daemonsets/statefulsets:"
+              kubectl -n longhorn-system get ds,sts || true
+              echo "[monitor] recent longhorn events:"
+              kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 30 || true
+              sleep 20
+            done
+
+            wait "${LONGHORN_HELM_PID}"
+            HELM_RC=$?
+            set -e
+
+            if [[ "${HELM_RC}" -ne 0 ]]; then
+              echo "[FAIL] Longhorn helm install failed with exit code ${HELM_RC}"
+              echo "[diagnostic] helm output:"
+              sed -n '1,220p' /tmp/longhorn-install.log || true
+              echo "[diagnostic] longhorn events:"
+              kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 80 || true
+              exit "${HELM_RC}"
+            fi
 
           echo "Installed Longhorn chart version: ${LONGHORN_VERSION}"
           {
@@ -521,7 +556,8 @@ jobs:
             echo "- Installed chart version: ${LONGHORN_VERSION}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          kubectl -n longhorn-system get pods
+            kubectl -n longhorn-system get pods -o wide
+            kubectl -n longhorn-system get deploy
 
       # ======================================================================
       # 5. TEST FIXTURES
