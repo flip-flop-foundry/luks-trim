@@ -290,22 +290,48 @@ jobs:
 
                 # Pull cluster and node status as soon as talosconfig exists so
                 # bootstrap progress is visible before kubectl is available.
-                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" get members >/tmp/talos-members-probe.log 2>&1; then
-                  echo "[monitor] talosctl get members: ok"
-                  sed -n '1,20p' /tmp/talos-members-probe.log || true
-                else
-                  MEMBERS_RC=$?
-                  echo "[monitor] talosctl get members rc=${MEMBERS_RC}"
-                  tail -n 2 /tmp/talos-members-probe.log || true
+                TALOS_NODE=""
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" config info -o yaml >/tmp/talos-config-info.log 2>&1; then
+                  TALOS_NODE=$(awk '
+                    /^nodes:/ {in_nodes=1; in_endpoints=0; next}
+                    /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
+                    /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
+                    in_nodes && $1 == "-" {print $2; exit}
+                  ' /tmp/talos-config-info.log)
+
+                  # Fallback: if nodes are not populated yet, use first endpoint host.
+                  if [[ -z "${TALOS_NODE}" ]]; then
+                    TALOS_NODE=$(awk '
+                      /^endpoints:/ {in_endpoints=1; next}
+                      /^[^[:space:]-]/ {in_endpoints=0}
+                      in_endpoints && $1 == "-" {print $2; exit}
+                    ' /tmp/talos-config-info.log | sed -E 's#^https?://##; s#:[0-9]+$##')
+                  fi
                 fi
 
-                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" get machinestatus >/tmp/talos-machinestatus-probe.log 2>&1; then
-                  echo "[monitor] talosctl get machinestatus: ok"
-                  sed -n '1,20p' /tmp/talos-machinestatus-probe.log || true
+                if [[ -n "${TALOS_NODE}" ]]; then
+                  echo "[monitor] talos node target: ${TALOS_NODE}"
+
+                  if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" --nodes "${TALOS_NODE}" get members >/tmp/talos-members-probe.log 2>&1; then
+                    echo "[monitor] talosctl get members: ok"
+                    sed -n '1,20p' /tmp/talos-members-probe.log || true
+                  else
+                    MEMBERS_RC=$?
+                    echo "[monitor] talosctl get members rc=${MEMBERS_RC}"
+                    sed -n '1,8p' /tmp/talos-members-probe.log || true
+                  fi
+
+                  if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" --nodes "${TALOS_NODE}" get machinestatus >/tmp/talos-machinestatus-probe.log 2>&1; then
+                    echo "[monitor] talosctl get machinestatus: ok"
+                    sed -n '1,20p' /tmp/talos-machinestatus-probe.log || true
+                  else
+                    MACHINESTATUS_RC=$?
+                    echo "[monitor] talosctl get machinestatus rc=${MACHINESTATUS_RC}"
+                    sed -n '1,8p' /tmp/talos-machinestatus-probe.log || true
+                  fi
                 else
-                  MACHINESTATUS_RC=$?
-                  echo "[monitor] talosctl get machinestatus rc=${MACHINESTATUS_RC}"
-                  tail -n 2 /tmp/talos-machinestatus-probe.log || true
+                  echo "[monitor] talos node target unavailable yet"
+                  sed -n '1,8p' /tmp/talos-config-info.log || true
                 fi
               fi
 
