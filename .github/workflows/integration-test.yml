@@ -516,7 +516,7 @@ jobs:
             --version     "${LONGHORN_VERSION}" \
             --set         defaultSettings.defaultReplicaCount=1 \
             --wait \
-              --timeout     20m >/tmp/longhorn-install.log 2>&1 &
+            --timeout     20m >/tmp/longhorn-install.log 2>&1 &
             LONGHORN_HELM_PID=$!
 
             while kill -0 "${LONGHORN_HELM_PID}" >/dev/null 2>&1; do
