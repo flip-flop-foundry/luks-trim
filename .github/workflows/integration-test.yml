@@ -565,7 +565,12 @@ jobs:
 
       - name: Create test namespace and LUKS key secret
         run: |
-          kubectl create namespace luks-trim-test
+          kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace luks-trim-test \
+            pod-security.kubernetes.io/enforce=privileged \
+            pod-security.kubernetes.io/audit=privileged \
+            pod-security.kubernetes.io/warn=privileged \
+            --overwrite
 
           # Random passphrase — strong enough for a CI test.
           PASSPHRASE=$(openssl rand -base64 32)
@@ -633,6 +638,9 @@ jobs:
               - name: filler
                 image: ubuntu:24.04
                 command: ["sleep", "3600"]
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
                 volumeMounts:
                   - name: data
                     mountPath: /data
