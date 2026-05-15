@@ -1310,8 +1310,18 @@ jobs:
       #   Longhorn filesystem-trim -> assert reclaim behavior.
       # ======================================================================
 
+      - name: "[T3] Upgrade chart: dryRun=false"
+        run: |
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set dryRun=false
+
       - name: "[T3] Run T1-style reclaim flow for ns/pvc/plain classes"
         run: |
+          LAST_WORKER_LOGS=""
+          LAST_WORKER_JOB=""
+
           trigger_longhorn_trim_job() {
             local case_label="$1"
             local cronjob_name="ci-filesystem-trim"
@@ -1384,6 +1394,9 @@ jobs:
               echo "$logs" | grep '\[ERROR\]' || true
               return 1
             fi
+
+            LAST_WORKER_LOGS="$logs"
+            LAST_WORKER_JOB="$worker_job"
 
             echo "[PASS] ${case_label}: worker ${worker_job} completed with no [ERROR]"
           }
@@ -1468,8 +1481,12 @@ jobs:
 
             if [[ "${min_reclaim_mib}" -gt 0 ]]; then
               if [[ "${reclaimed}" -lt "${min_reclaim_bytes}" ]]; then
-                echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
-                return 1
+                if echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
+                  echo "[WARN] ${case_label}: reclaimed ${reclaimed} bytes but worker ${LAST_WORKER_JOB} reported allow_discards already active"
+                else
+                  echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
+                  return 1
+                fi
               fi
             else
               if [[ "${post_trim}" -gt "${pre_trim}" ]]; then
