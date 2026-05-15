@@ -249,6 +249,10 @@ jobs:
               RUNNER_TALOS_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
               ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
               TALOS_CFG=""
+              if test -f "$TALOSCONFIG"; then
+                TALOS_CFG="$TALOSCONFIG"
+              fi
+
               if test -d "${RUNNER_TALOS_DIR}"; then
                 echo "[monitor] talos state dir exists: ${RUNNER_TALOS_DIR}"
                 ls -1 "${RUNNER_TALOS_DIR}" || true
@@ -304,17 +308,19 @@ jobs:
           # runners (CNI + hypervisor setup).
           # Guard with an explicit timeout so this step cannot hang forever.
           set +e
-          timeout --signal=TERM 40m sudo --preserve-env=HOME talosctl cluster create qemu \
+          timeout --signal=TERM 40m sudo --preserve-env=HOME talosctl cluster create dev \
             --name          "$CLUSTER_NAME" \
+            --arch          amd64 \
             --controlplanes 1 \
             --workers       0 \
-            --disks         "virtio:${TALOS_DISK_MIB}MiB" \
-            --memory-controlplanes "4096MiB" \
-            --cpus-controlplanes   "2.0" \
+            --disk          "${TALOS_DISK_MIB}" \
+            --disk-preallocate=false \
+            --memory        "4096MiB" \
+            --cpus          "2.0" \
             --talos-version "v${TALOS_VERSION}" \
-            --schematic-id  "${SCHEMATIC_ID}" \
-            --config-patch-controlplanes @/tmp/mc-patch.yaml \
-            --talosconfig-destination "$TALOSCONFIG"
+            --config-patch-control-plane @/tmp/mc-patch.yaml \
+            --talosconfig   "$TALOSCONFIG" \
+            --wait-timeout  30m
           CREATE_RC=$?
           set -e
 
@@ -325,8 +331,15 @@ jobs:
             echo "[FAIL] talosctl cluster create failed with exit code ${CREATE_RC}"
             echo "[diagnostic] qemu processes:"
             ps -ef | grep -E "qemu-system|dnsmasq|tap|bridge" | grep -v grep || true
+            echo "[diagnostic] runner talos state tree (if present):"
+            ls -R "${HOME}/.talos" || true
             echo "[diagnostic] /root/.talos tree (if present):"
             sudo ls -R /root/.talos || true
+            echo "[diagnostic] controlplane log tail (if present):"
+            tail -n 200 "${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1.log" || true
+            echo "[diagnostic] dhcpd/lb log tails (if present):"
+            tail -n 80 "${HOME}/.talos/clusters/${CLUSTER_NAME}/dhcpd.log" || true
+            tail -n 80 "${HOME}/.talos/clusters/${CLUSTER_NAME}/lb.log" || true
             exit "${CREATE_RC}"
           fi
 
