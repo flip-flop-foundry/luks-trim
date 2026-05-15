@@ -1398,7 +1398,7 @@ jobs:
             LAST_WORKER_LOGS="$logs"
             LAST_WORKER_JOB="$worker_job"
 
-            echo "[PASS] ${case_label}: worker ${worker_job} completed with no [ERROR]"
+            echo "[PASS] ${case_label}: worker ${worker_job} completed cleanly (no failure markers in worker log)"
           }
 
           run_case() {
@@ -1476,8 +1476,11 @@ jobs:
             post_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
             local reclaimed=$(( pre_trim - post_trim ))
             local min_reclaim_bytes=$(( min_reclaim_mib * 1024 * 1024 ))
+            local pre_trim_mib=$(( pre_trim / 1024 / 1024 ))
+            local post_trim_mib=$(( post_trim / 1024 / 1024 ))
+            local reclaimed_mib=$(( reclaimed / 1024 / 1024 ))
 
-            echo "[diagnostic] ${case_label}: pre=${pre_trim} post=${post_trim} reclaimed=${reclaimed}"
+            echo "[INFO] ${case_label}: before=${pre_trim_mib}MiB (${pre_trim} bytes), after=${post_trim_mib}MiB (${post_trim} bytes), reclaimed=${reclaimed_mib}MiB (${reclaimed} bytes)"
 
             if [[ "${min_reclaim_mib}" -gt 0 ]]; then
               if [[ "${reclaimed}" -lt "${min_reclaim_bytes}" ]]; then
