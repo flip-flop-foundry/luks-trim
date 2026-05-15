@@ -1408,6 +1408,10 @@ jobs:
             local pod_name="$4"
             local write_mib="$5"
             local min_reclaim_mib="$6"
+            local run_luks_trim="$7"
+
+            LAST_WORKER_LOGS=""
+            LAST_WORKER_JOB=""
 
             echo "===== [T3:${case_label}] storageClass=${storage_class} pvc=${pvc_name} ====="
 
@@ -1468,7 +1472,12 @@ jobs:
             local pre_trim
             pre_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
 
-            run_luks_trim_and_assert_worker "${case_label}"
+            if [[ "${run_luks_trim}" == "true" ]]; then
+              run_luks_trim_and_assert_worker "${case_label}"
+            else
+              echo "[INFO] ${case_label}: skipping luks-trim worker (no-encryption class)"
+            fi
+
             trigger_longhorn_trim_job "${case_label}"
             sleep 20
 
@@ -1484,7 +1493,7 @@ jobs:
 
             if [[ "${min_reclaim_mib}" -gt 0 ]]; then
               if [[ "${reclaimed}" -lt "${min_reclaim_bytes}" ]]; then
-                if echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
+                if [[ "${run_luks_trim}" == "true" ]] && echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
                   echo "[WARN] ${case_label}: reclaimed ${reclaimed} bytes but worker ${LAST_WORKER_JOB} reported allow_discards already active"
                 else
                   echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
@@ -1506,9 +1515,9 @@ jobs:
             echo "[PASS] ${case_label}: T1-style reclaim flow passed"
           }
 
-          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128
-          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128
-          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 0
+          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128 true
+          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128 true
+          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 128 false
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown
