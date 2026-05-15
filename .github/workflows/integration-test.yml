@@ -438,9 +438,33 @@ jobs:
           # the runner user; normalize ownership before using it.
           sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
 
+          TALOS_NODE=""
+          if timeout --signal=TERM 10s talosctl --talosconfig "$TALOSCONFIG" config info -o yaml >/tmp/talos-config-info-postcreate.log 2>&1; then
+            TALOS_NODE=$(awk '
+              /^nodes:/ {in_nodes=1; in_endpoints=0; next}
+              /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
+              /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
+              in_nodes && $1 == "-" {print $2; exit}
+            ' /tmp/talos-config-info-postcreate.log)
+
+            if [[ -z "${TALOS_NODE}" ]]; then
+              TALOS_NODE=$(awk '
+                /^endpoints:/ {in_endpoints=1; next}
+                /^[^[:space:]-]/ {in_endpoints=0}
+                in_endpoints && $1 == "-" {print $2; exit}
+              ' /tmp/talos-config-info-postcreate.log | sed -E 's#^https?://##; s#:[0-9]+$##')
+            fi
+          fi
+
+          if [[ -z "${TALOS_NODE}" ]]; then
+            echo "[FAIL] Could not determine Talos node target from talosconfig"
+            sed -n '1,40p' /tmp/talos-config-info-postcreate.log || true
+            exit 1
+          fi
+
           talosctl \
             --talosconfig "$TALOSCONFIG" \
-            kubeconfig --merge=false /tmp/kubeconfig
+            kubeconfig --nodes "$TALOS_NODE" --merge=false /tmp/kubeconfig
           sudo cp /tmp/kubeconfig "$KUBECONFIG"
           sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
 
