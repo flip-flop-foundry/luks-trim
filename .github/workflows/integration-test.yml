@@ -280,8 +280,6 @@ jobs:
               fi
 
               if test -d "${RUNNER_TALOS_DIR}"; then
-                echo "[monitor] talos state dir exists: ${RUNNER_TALOS_DIR}"
-                ls -1 "${RUNNER_TALOS_DIR}" || true
                 if test -f "${RUNNER_TALOS_DIR}/talosconfig"; then
                   TALOS_CFG="${RUNNER_TALOS_DIR}/talosconfig"
                 fi
@@ -865,6 +863,19 @@ jobs:
       - name: "[T1] Assert worker pods exited 0 and contain no [ERROR] lines"
         run: |
           WORKER_JOB="${{ steps.live-run.outputs.worker_job }}"
+
+          print_worker_termination_details() {
+            local job_name="$1"
+            echo "[diagnostic] worker termination details for ${job_name}:"
+            kubectl get pods -n luks-trim -l "job-name=${job_name}" \
+              -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" podReason="}{.status.reason}{" termReason="}{.status.containerStatuses[0].state.terminated.reason}{" exitCode="}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}{end}' || true
+
+            for POD in $(kubectl get pods -n luks-trim -l "job-name=${job_name}" -o name 2>/dev/null); do
+              echo "[diagnostic] ${POD} container status excerpt:"
+              kubectl describe -n luks-trim "${POD}" | sed -n '/^Containers:/,/^Conditions:/p' || true
+            done
+          }
+
           WORKER_LOGS=$(kubectl logs -n luks-trim \
             -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
 
@@ -880,6 +891,7 @@ jobs:
             -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
           if [[ "${JOB_FAILED}" -gt 0 ]]; then
             echo "[FAIL] Worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
+            print_worker_termination_details "${WORKER_JOB}"
             echo "$WORKER_LOGS"
             exit 1
           fi
@@ -1071,6 +1083,28 @@ jobs:
       - name: "[T2] Assert [dry-run] lines present and no [ERROR] lines"
         run: |
           WORKER_JOB="${{ steps.dry-run-job.outputs.worker_job }}"
+
+          print_worker_termination_details() {
+            local job_name="$1"
+            echo "[diagnostic] worker termination details for ${job_name}:"
+            kubectl get pods -n luks-trim -l "job-name=${job_name}" \
+              -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" podReason="}{.status.reason}{" termReason="}{.status.containerStatuses[0].state.terminated.reason}{" exitCode="}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}{end}' || true
+
+            for POD in $(kubectl get pods -n luks-trim -l "job-name=${job_name}" -o name 2>/dev/null); do
+              echo "[diagnostic] ${POD} container status excerpt:"
+              kubectl describe -n luks-trim "${POD}" | sed -n '/^Containers:/,/^Conditions:/p' || true
+            done
+          }
+
+          JOB_FAILED=$(kubectl get job "${WORKER_JOB}" -n luks-trim \
+            -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
+          if [[ "${JOB_FAILED}" -gt 0 ]]; then
+            echo "[FAIL] Dry-run worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
+            print_worker_termination_details "${WORKER_JOB}"
+            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null || true
+            exit 1
+          fi
+
           LOGS=$(kubectl logs -n luks-trim \
             -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
 
@@ -1150,6 +1184,15 @@ jobs:
           echo "=== Worker logs ==="
           kubectl logs -n luks-trim \
             -l "luks-trim/role=worker" --tail=200 || true
+
+          echo "=== Worker pod termination details ==="
+          kubectl get pods -n luks-trim -l "luks-trim/role=worker" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" podReason="}{.status.reason}{" termReason="}{.status.containerStatuses[0].state.terminated.reason}{" exitCode="}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}{end}' || true
+
+          for POD in $(kubectl get pods -n luks-trim -l "luks-trim/role=worker" -o name 2>/dev/null); do
+            echo "=== ${POD} container status excerpt ==="
+            kubectl describe -n luks-trim "${POD}" | sed -n '/^Containers:/,/^Conditions:/p' || true
+          done
 
           echo "=== Longhorn manager logs (last 50 lines) ==="
           kubectl logs -n longhorn-system \

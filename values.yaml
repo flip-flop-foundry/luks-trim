@@ -230,7 +230,7 @@ coordinatorResources:
     memory: 32Mi
   limits:
     cpu: 100m
-    memory: 64Mi
+    memory: 512Mi
 
 # workerResources — injected into each per-node Job. fstrim is I/O-intensive;
 # CPU/memory limits are modest but preventing unbounded I/O competition with
@@ -242,7 +242,7 @@ workerResources:
     memory: 64Mi
   limits:
     cpu: 500m
-    memory: 128Mi
+    memory: 512Mi
 #   limits:
 #     memory: 128Mi
 
