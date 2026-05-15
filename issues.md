@@ -92,7 +92,8 @@ The workflow must provision:
    - Longhorn Actual Size shrinks (encrypted volumes).
    - qcow2 file size shrinks (Talos fstrim reclaims space from the VM disk).
    - All pods exited 0, no `[ERROR]` lines.
-8. Re-run luks-trim with `dryRun: true` and assert no size changes occur and
+8. Write another 2 GiB file to each volume and delete it.
+9. Re-run luks-trim with `dryRun: true` and assert no size changes occur and
    logs contain `[dry-run]` lines for every volume.
 
 
@@ -188,3 +189,18 @@ against Talos source before implementation. Tracking separately.
 
 Requires TPM hardware and interaction with the TPM device from inside the worker
 pod. Out of scope until there is a concrete use case.
+
+
+# 5. Chart improvements
+
+* Maybe we should have ability to add labels to the luks-trim NS for:
+
+pod-security.kubernetes.io/enforce=privileged \
+pod-security.kubernetes.io/audit=privileged \
+pod-security.kubernetes.io/warn=privileged \
+
+
+# 6. Test improvments
+
+ * At the time of writing we dont have any tests for dry-run on new volumes (volumes that havent had discard enabled)
+  * We should have test cases for this.

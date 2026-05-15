@@ -154,13 +154,12 @@ data:
     #   - unencrypted: skip key lookup (no unlock required)
     # This keeps the worker safe for mixed storage classes.
     #
-    # NOTE — fstrim is NOT run here. Longhorn itself handles periodic TRIM via
-    # its own "Trim Filesystem" job. You must create and schedule that job
-    # separately in the Longhorn UI or via a RecurringJob resource. Once
-    # allow-discards is enabled by this chart, Longhorn's trim job will work
-    # correctly through the encrypted device.
+    # NOTE — for encrypted volumes fstrim is NOT run here; Longhorn's own
+    # "Trim Filesystem" RecurringJob handles that once allow-discards is
+    # enabled.  For unencrypted volumes there is no LUKS layer to configure,
+    # so fstrim is run directly in this function instead.
     process_longhorn_volumes() {
-      echo "--- Checking Longhorn encrypted volumes..."
+      echo "--- Checking Longhorn volumes..."
       _dev_path="${LONGHORN_DEVICE_PATH:-/dev/longhorn}"
       if [ ! -d "$_dev_path" ] || [ -z "$(ls "$_dev_path"/ 2>/dev/null)" ]; then
         echo "  No volumes in $_dev_path on this node"; return
@@ -176,9 +175,28 @@ data:
         [ -e "$_dev" ] || continue
         _name=$(basename "$_dev")
 
-        # Unencrypted Longhorn volumes do not need key lookup or LUKS refresh.
+        # Unencrypted Longhorn volumes: skip key operations and run fstrim
+        # directly — there is no LUKS allow-discards flag to configure.
         if ! cryptsetup isLuks "$_dev" >/dev/null 2>&1; then
-          echo "  $_name: not a LUKS device, skipping key lookup"
+          _real=$(readlink -f "$_dev" 2>/dev/null)
+          _mp=$(awk -v d1="$_real" -v d2="$_dev" \
+            '$1==d1 || $1==d2 {print $2; exit}' /proc/1/mounts 2>/dev/null)
+          if [ -z "$_mp" ]; then
+            echo "  $_name: not LUKS-encrypted, not mounted on this node — skipping"
+          else
+            echo "  $_name: not LUKS-encrypted, mounted at $_mp — running fstrim"
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+              _out=$(nsenter --mount=/proc/1/ns/mnt -- fstrim -n -v "$_mp" 2>&1)
+              _rc=$?
+              printf '%s\n' "$_out" | sed 's/^/  [dry-run] /'
+              [ "$_rc" -eq 0 ] || echo "  [fstrim] [dry-run] fstrim -n exited $_rc"
+            else
+              _out=$(nsenter --mount=/proc/1/ns/mnt -- fstrim -v "$_mp" 2>&1)
+              _rc=$?
+              printf '%s\n' "$_out" | sed 's/^/  /'
+              [ "$_rc" -eq 0 ] || echo "  [fstrim] [warn] fstrim exited $_rc"
+            fi
+          fi
           continue
         fi
 
