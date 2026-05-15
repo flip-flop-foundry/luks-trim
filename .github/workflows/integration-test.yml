@@ -234,14 +234,46 @@ jobs:
           # the same job, so we run a background heartbeat while Talos creates
           # the cluster. This prevents long periods of silent logs.
           MONITOR_START=$(date +%s)
+          ROUTE_DIAG_DUMPED=0
+
+          dump_network_diagnostics() {
+            local target_node="${1:-}"
+
+            echo "[diagnostic] network interfaces (brief):"
+            ip -br addr || true
+            echo "[diagnostic] network links (brief):"
+            ip -br link || true
+            echo "[diagnostic] route table:"
+            ip route show || true
+            echo "[diagnostic] bridge links:"
+            bridge link show || true
+
+            if [[ -n "${target_node}" ]]; then
+              echo "[diagnostic] route lookup for ${target_node}:"
+              ip route get "${target_node}" || true
+            fi
+
+            local cp_pid_file="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1.pid"
+            if [[ -f "${cp_pid_file}" ]]; then
+              local cp_pid
+              cp_pid=$(cat "${cp_pid_file}" 2>/dev/null || true)
+              echo "[diagnostic] controlplane pid file: ${cp_pid_file} -> ${cp_pid:-unknown}"
+              if [[ -n "${cp_pid}" ]]; then
+                ps -p "${cp_pid}" -o pid,ppid,stat,etime,command || true
+              fi
+            else
+              echo "[diagnostic] controlplane pid file missing: ${cp_pid_file}"
+            fi
+          }
+
           monitor_talos_create() {
             while true; do
               NOW=$(date +%s)
               ELAPSED=$(( NOW - MONITOR_START ))
               echo "[monitor] $(date -u +%Y-%m-%dT%H:%M:%SZ) talos-create elapsed=${ELAPSED}s"
 
-              QEMU_COUNT=$(pgrep -fc qemu-system || true)
-              echo "[monitor] qemu-system process count: ${QEMU_COUNT}"
+              QEMU_COUNT=$(pgrep -fc 'qemu-system|qemu-kvm' || true)
+              echo "[monitor] qemu process count (system|kvm): ${QEMU_COUNT}"
 
               FREE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
               echo "[monitor] host free space under $HOME: ${FREE_MIB:-unknown}MiB"
@@ -319,6 +351,12 @@ jobs:
                     MEMBERS_RC=$?
                     echo "[monitor] talosctl get members rc=${MEMBERS_RC}"
                     sed -n '1,8p' /tmp/talos-members-probe.log || true
+
+                    if [[ "${ROUTE_DIAG_DUMPED}" -eq 0 ]] && grep -q "no route to host" /tmp/talos-members-probe.log; then
+                      echo "[monitor] first no-route-to-host observed during get members"
+                      dump_network_diagnostics "${TALOS_NODE}"
+                      ROUTE_DIAG_DUMPED=1
+                    fi
                   fi
 
                   if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" --nodes "${TALOS_NODE}" get machinestatus >/tmp/talos-machinestatus-probe.log 2>&1; then
@@ -328,6 +366,12 @@ jobs:
                     MACHINESTATUS_RC=$?
                     echo "[monitor] talosctl get machinestatus rc=${MACHINESTATUS_RC}"
                     sed -n '1,8p' /tmp/talos-machinestatus-probe.log || true
+
+                    if [[ "${ROUTE_DIAG_DUMPED}" -eq 0 ]] && grep -q "no route to host" /tmp/talos-machinestatus-probe.log; then
+                      echo "[monitor] first no-route-to-host observed during get machinestatus"
+                      dump_network_diagnostics "${TALOS_NODE}"
+                      ROUTE_DIAG_DUMPED=1
+                    fi
                   fi
                 else
                   echo "[monitor] talos node target unavailable yet"
@@ -376,7 +420,9 @@ jobs:
           if [[ "${CREATE_RC}" -ne 0 ]]; then
             echo "[FAIL] talosctl cluster create failed with exit code ${CREATE_RC}"
             echo "[diagnostic] qemu processes:"
-            ps -ef | grep -E "qemu-system|dnsmasq|tap|bridge" | grep -v grep || true
+            ps -ef | grep -E "qemu-system|qemu-kvm|dnsmasq|tap|bridge" | grep -v grep || true
+            echo "[diagnostic] host networking:"
+            dump_network_diagnostics "${TALOS_NODE:-}"
             echo "[diagnostic] runner talos state tree (if present):"
             ls -R "${HOME}/.talos" || true
             echo "[diagnostic] /root/.talos tree (if present):"
