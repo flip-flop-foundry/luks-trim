@@ -662,13 +662,13 @@ jobs:
             fsType: ext4
             encrypted: "true"
             csi.storage.k8s.io/provisioner-secret-name:      luks-ns-shared
-            csi.storage.k8s.io/provisioner-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
             csi.storage.k8s.io/node-publish-secret-name:     luks-ns-shared
-            csi.storage.k8s.io/node-publish-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
             csi.storage.k8s.io/node-stage-secret-name:       luks-ns-shared
-            csi.storage.k8s.io/node-stage-secret-namespace:  luks-trim-test
+            csi.storage.k8s.io/node-stage-secret-namespace:  ${pvc.namespace}
             csi.storage.k8s.io/node-expand-secret-name:      luks-ns-shared
-            csi.storage.k8s.io/node-expand-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
           ---
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -684,14 +684,14 @@ jobs:
             fromBackup: ""
             fsType: ext4
             encrypted: "true"
-            csi.storage.k8s.io/provisioner-secret-name:      luks-pvc-key
-            csi.storage.k8s.io/provisioner-secret-namespace: luks-trim-test
-            csi.storage.k8s.io/node-publish-secret-name:     luks-pvc-key
-            csi.storage.k8s.io/node-publish-secret-namespace: luks-trim-test
-            csi.storage.k8s.io/node-stage-secret-name:       luks-pvc-key
-            csi.storage.k8s.io/node-stage-secret-namespace:  luks-trim-test
-            csi.storage.k8s.io/node-expand-secret-name:      luks-pvc-key
-            csi.storage.k8s.io/node-expand-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/provisioner-secret-name:      ${pvc.name}
+            csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
+            csi.storage.k8s.io/node-publish-secret-name:     ${pvc.name}
+            csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+            csi.storage.k8s.io/node-stage-secret-name:       ${pvc.name}
+            csi.storage.k8s.io/node-stage-secret-namespace:  ${pvc.namespace}
+            csi.storage.k8s.io/node-expand-secret-name:      ${pvc.name}
+            csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
           ---
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -1321,7 +1321,7 @@ jobs:
             storageClassName: luks-ns-key
             resources:
               requests:
-                storage: 2Gi
+                storage: 512Mi
           ---
           apiVersion: v1
           kind: PersistentVolumeClaim
@@ -1333,7 +1333,7 @@ jobs:
             storageClassName: luks-pvc-key
             resources:
               requests:
-                storage: 2Gi
+                storage: 512Mi
           ---
           apiVersion: v1
           kind: PersistentVolumeClaim
@@ -1345,7 +1345,7 @@ jobs:
             storageClassName: no-encryption
             resources:
               requests:
-                storage: 2Gi
+                storage: 512Mi
           ---
           apiVersion: v1
           kind: Pod
