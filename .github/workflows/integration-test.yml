@@ -39,9 +39,11 @@ on:
         default: ''
         type: string
       longhorn-version:
-        description: 'Longhorn Helm chart version (longhorn/longhorn).'
+        description: >
+          Longhorn Helm chart version (longhorn/longhorn).
+          Leave blank to auto-detect and install the latest available release.
         required: false
-        default: '1.8.1'
+        default: ''
         type: string
 
 # Only one integration-test run at a time; a newer push cancels the old one.
@@ -63,6 +65,8 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read          # checkout only; no writes back to the repo
+    outputs:
+      longhorn-version: ${{ steps.longhorn.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -212,16 +216,47 @@ jobs:
       # ======================================================================
 
       - name: Install Longhorn
+        id: longhorn
         run: |
+          REQUESTED_VERSION="${{ inputs.longhorn-version }}"
+
           helm repo add longhorn https://charts.longhorn.io
           helm repo update
+
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            LONGHORN_VERSION="$REQUESTED_VERSION"
+            echo "Longhorn version source: workflow input"
+          else
+            LONGHORN_VERSION=$(helm search repo longhorn/longhorn --versions | awk 'NR==2 {print $2}')
+            if [[ -z "$LONGHORN_VERSION" ]]; then
+              echo "[FAIL] Could not detect latest Longhorn chart version from Helm repo"
+              exit 1
+            fi
+            echo "Longhorn version source: auto-detected latest from Helm repo"
+          fi
+
+          echo "Installing Longhorn chart version: ${LONGHORN_VERSION}"
+          echo "version=${LONGHORN_VERSION}" >> "$GITHUB_OUTPUT"
+
           helm upgrade --install longhorn longhorn/longhorn \
             --namespace   longhorn-system \
             --create-namespace \
-            --version     "${{ inputs.longhorn-version }}" \
+            --version     "${LONGHORN_VERSION}" \
             --set         defaultSettings.defaultReplicaCount=1 \
             --wait \
             --timeout     20m
+
+          echo "Installed Longhorn chart version: ${LONGHORN_VERSION}"
+          {
+            echo "### Longhorn Chart Version"
+            if [[ -n "$REQUESTED_VERSION" ]]; then
+              echo "- Requested via workflow input: ${REQUESTED_VERSION}"
+            else
+              echo "- Requested via workflow input: <empty>"
+            fi
+            echo "- Installed chart version: ${LONGHORN_VERSION}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           kubectl -n longhorn-system get pods
 
       # ======================================================================
