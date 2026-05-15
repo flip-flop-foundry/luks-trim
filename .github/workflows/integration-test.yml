@@ -287,6 +287,26 @@ jobs:
                   echo "[monitor] talosctl health probe rc=${HEALTH_RC}"
                   tail -n 1 /tmp/talos-health-probe.log || true
                 fi
+
+                # Pull cluster and node status as soon as talosconfig exists so
+                # bootstrap progress is visible before kubectl is available.
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" get members >/tmp/talos-members-probe.log 2>&1; then
+                  echo "[monitor] talosctl get members: ok"
+                  sed -n '1,20p' /tmp/talos-members-probe.log || true
+                else
+                  MEMBERS_RC=$?
+                  echo "[monitor] talosctl get members rc=${MEMBERS_RC}"
+                  tail -n 2 /tmp/talos-members-probe.log || true
+                fi
+
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "${TALOS_CFG}" get machinestatus >/tmp/talos-machinestatus-probe.log 2>&1; then
+                  echo "[monitor] talosctl get machinestatus: ok"
+                  sed -n '1,20p' /tmp/talos-machinestatus-probe.log || true
+                else
+                  MACHINESTATUS_RC=$?
+                  echo "[monitor] talosctl get machinestatus rc=${MACHINESTATUS_RC}"
+                  tail -n 2 /tmp/talos-machinestatus-probe.log || true
+                fi
               fi
 
               sleep 20
