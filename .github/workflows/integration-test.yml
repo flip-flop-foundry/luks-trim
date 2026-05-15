@@ -195,12 +195,6 @@ jobs:
           machine:
             install:
               image: factory.talos.dev/installer/${SCHEMATIC_ID}:v${TALOS_VERSION}
-            files:
-              - path: /etc/iscsi/initiatorname.iscsi
-                permissions: 0o644
-                op: create
-                content: |
-                  InitiatorName=iqn.2025-01.io.longhorn:luks-trim-test
           EOF
 
           AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
