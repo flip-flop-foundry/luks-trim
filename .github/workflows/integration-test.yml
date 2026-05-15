@@ -187,7 +187,9 @@ jobs:
                   InitiatorName=iqn.2025-01.io.longhorn:luks-trim-test
           EOF
 
-          talosctl cluster create \
+          # qemu provisioner requires root privileges on GitHub-hosted Linux
+          # runners (CNI + hypervisor setup).
+          sudo -E talosctl cluster create dev \
             --name          "$CLUSTER_NAME" \
             --provisioner   qemu \
             --controlplanes 1 \
@@ -201,8 +203,22 @@ jobs:
             --wait-timeout  30m
 
           # Export configs to workspace paths consumed by later steps.
-          cp ~/.talos/clusters/${CLUSTER_NAME}/talosconfig "$TALOSCONFIG"
-          talosctl --talosconfig "$TALOSCONFIG" kubeconfig --merge=false "$KUBECONFIG"
+          # Since cluster creation runs as root, Talos state is written under
+          # /root/.talos by default.
+          ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
+          if [[ ! -f "${ROOT_TALOS_DIR}/talosconfig" ]]; then
+            echo "[FAIL] Expected talosconfig not found at ${ROOT_TALOS_DIR}/talosconfig"
+            exit 1
+          fi
+
+          sudo cp "${ROOT_TALOS_DIR}/talosconfig" "$TALOSCONFIG"
+          sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
+
+          sudo -E talosctl \
+            --talosconfig "${ROOT_TALOS_DIR}/talosconfig" \
+            kubeconfig --merge=false /tmp/kubeconfig
+          sudo cp /tmp/kubeconfig "$KUBECONFIG"
+          sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
 
       - name: Wait for node Ready
         run: |
