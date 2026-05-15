@@ -582,31 +582,52 @@ jobs:
       # 5. TEST FIXTURES
       # ======================================================================
 
-      - name: Create test namespace and LUKS key secret
+      - name: Create test namespace and Longhorn key secrets
         run: |
           kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
 
-          # Random passphrase — strong enough for a CI test.
-          PASSPHRASE=$(openssl rand -base64 32)
+          # Distinct passphrases per test class so key-lookup paths are testable.
+          GLOBAL_PASSPHRASE=$(openssl rand -base64 32)
+          NS_PASSPHRASE=$(openssl rand -base64 32)
+          PVC_PASSPHRASE=$(openssl rand -base64 32)
 
-          # Secret format matches what Longhorn's CSI encryption driver expects
-          # and what luks-trim reads for the globalKey lookup.
+          # Global key secret (longhorn-system namespace).
           kubectl create secret generic longhorn-crypto \
             --namespace longhorn-system \
-            --from-literal=CRYPTO_KEY_VALUE="${PASSPHRASE}" \
+            --from-literal=CRYPTO_KEY_VALUE="${GLOBAL_PASSPHRASE}" \
             --from-literal=CRYPTO_KEY_PROVIDER=secret \
             --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
             --from-literal=CRYPTO_KEY_HASH=sha256 \
             --from-literal=CRYPTO_KEY_SIZE=256 \
             --from-literal=CRYPTO_PBKDF=argon2i
 
-      - name: Create encrypted Longhorn StorageClass
+          # Namespace-shared key secret (luks-trim-test namespace).
+          kubectl create secret generic luks-ns-shared \
+            --namespace luks-trim-test \
+            --from-literal=CRYPTO_KEY_VALUE="${NS_PASSPHRASE}" \
+            --from-literal=CRYPTO_KEY_PROVIDER=secret \
+            --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
+            --from-literal=CRYPTO_KEY_HASH=sha256 \
+            --from-literal=CRYPTO_KEY_SIZE=256 \
+            --from-literal=CRYPTO_PBKDF=argon2i
+
+          # Per-PVC key secret. Name must match the PVC name for per-PVC lookup tests.
+          kubectl create secret generic luks-pvc-key \
+            --namespace luks-trim-test \
+            --from-literal=CRYPTO_KEY_VALUE="${PVC_PASSPHRASE}" \
+            --from-literal=CRYPTO_KEY_PROVIDER=secret \
+            --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
+            --from-literal=CRYPTO_KEY_HASH=sha256 \
+            --from-literal=CRYPTO_KEY_SIZE=256 \
+            --from-literal=CRYPTO_PBKDF=argon2i
+
+      - name: Create Longhorn StorageClasses
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
           metadata:
-            name: longhorn-encrypted
+            name: luks-global-key
           provisioner: driver.longhorn.io
           allowVolumeExpansion: true
           reclaimPolicy: Delete
@@ -625,6 +646,67 @@ jobs:
             csi.storage.k8s.io/node-stage-secret-namespace:  longhorn-system
             csi.storage.k8s.io/node-expand-secret-name:      longhorn-crypto
             csi.storage.k8s.io/node-expand-secret-namespace: longhorn-system
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: luks-ns-key
+          provisioner: driver.longhorn.io
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          parameters:
+            numberOfReplicas: "1"
+            staleReplicaTimeout: "2880"
+            fromBackup: ""
+            fsType: ext4
+            encrypted: "true"
+            csi.storage.k8s.io/provisioner-secret-name:      luks-ns-shared
+            csi.storage.k8s.io/provisioner-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-publish-secret-name:     luks-ns-shared
+            csi.storage.k8s.io/node-publish-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-stage-secret-name:       luks-ns-shared
+            csi.storage.k8s.io/node-stage-secret-namespace:  luks-trim-test
+            csi.storage.k8s.io/node-expand-secret-name:      luks-ns-shared
+            csi.storage.k8s.io/node-expand-secret-namespace: luks-trim-test
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: luks-pvc-key
+          provisioner: driver.longhorn.io
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          parameters:
+            numberOfReplicas: "1"
+            staleReplicaTimeout: "2880"
+            fromBackup: ""
+            fsType: ext4
+            encrypted: "true"
+            csi.storage.k8s.io/provisioner-secret-name:      luks-pvc-key
+            csi.storage.k8s.io/provisioner-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-publish-secret-name:     luks-pvc-key
+            csi.storage.k8s.io/node-publish-secret-namespace: luks-trim-test
+            csi.storage.k8s.io/node-stage-secret-name:       luks-pvc-key
+            csi.storage.k8s.io/node-stage-secret-namespace:  luks-trim-test
+            csi.storage.k8s.io/node-expand-secret-name:      luks-pvc-key
+            csi.storage.k8s.io/node-expand-secret-namespace: luks-trim-test
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: no-encryption
+          provisioner: driver.longhorn.io
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          parameters:
+            numberOfReplicas: "1"
+            staleReplicaTimeout: "2880"
+            fromBackup: ""
+            fsType: ext4
+            encrypted: "false"
           EOF
 
       - name: Create test PVC and filler pod
@@ -637,7 +719,7 @@ jobs:
             namespace: luks-trim-test
           spec:
             accessModes: [ReadWriteOnce]
-            storageClassName: longhorn-encrypted
+            storageClassName: luks-global-key
             resources:
               requests:
                 storage: 5Gi
@@ -701,6 +783,7 @@ jobs:
             --set longhorn.globalKey.enabled=true \
             --set longhorn.globalKey.secretName=longhorn-crypto \
             --set longhorn.globalKey.secretNamespace=longhorn-system \
+            --set-json 'longhorn.namespaceSecrets=[{"namespace":"luks-trim-test","secretNames":["luks-ns-shared","luks-pvc-key"]}]' \
             --set talos.enabled=false \
             --set dryRun=false \
             --set 'schedule=0 3 1 1 *'   # dormant; jobs triggered manually
@@ -1217,6 +1300,135 @@ jobs:
           fi
 
           echo "[PASS] actualSize stable during dry run (delta: ${DELTA} bytes)"
+
+      # ======================================================================
+      # T3 — STORAGECLASS COVERAGE (smoke)
+      #
+      # Add baseline coverage for all supported Longhorn StorageClasses without
+      # changing the established T1/T2 flow.
+      # ======================================================================
+
+      - name: "[T3] Create PVCs and pods for ns/pvc/plain classes"
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: t3-ns-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-ns-key
+            resources:
+              requests:
+                storage: 2Gi
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: luks-pvc-key
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-pvc-key
+            resources:
+              requests:
+                storage: 2Gi
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: t3-plain-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: no-encryption
+            resources:
+              requests:
+                storage: 2Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t3-ns-filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: t3-ns-vol
+            restartPolicy: Never
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t3-pvc-filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: luks-pvc-key
+            restartPolicy: Never
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t3-plain-filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: t3-plain-vol
+            restartPolicy: Never
+          EOF
+
+          kubectl wait pod/t3-ns-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+          kubectl wait pod/t3-pvc-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+          kubectl wait pod/t3-plain-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+
+      - name: "[T3] Assert PVCs are bound across all classes"
+        run: |
+          for PVC in test-vol t3-ns-vol luks-pvc-key t3-plain-vol; do
+            PHASE=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.status.phase}')
+            SC=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.spec.storageClassName}')
+            echo "${PVC}: phase=${PHASE} storageClass=${SC}"
+            if [[ "${PHASE}" != "Bound" ]]; then
+              echo "[FAIL] PVC ${PVC} is not Bound"
+              kubectl describe pvc "${PVC}" -n luks-trim-test || true
+              exit 1
+            fi
+          done
+
+      - name: "[T3] Smoke write/read for ns/pvc/plain classes"
+        run: |
+          for POD in t3-ns-filler t3-pvc-filler t3-plain-filler; do
+            echo "[diagnostic] smoke write/read in ${POD}"
+            kubectl exec "${POD}" -n luks-trim-test -- \
+              sh -c 'dd if=/dev/urandom of=/data/t3-smoke.bin bs=1M count=64 status=none && sync && test -s /data/t3-smoke.bin && wc -c /data/t3-smoke.bin'
+          done
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown
