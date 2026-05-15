@@ -657,6 +657,13 @@ jobs:
       - name: Install luks-trim chart
         run: |
           IMAGE="${{ inputs.worker-image }}"
+          kubectl create namespace luks-trim --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace luks-trim \
+            pod-security.kubernetes.io/enforce=privileged \
+            pod-security.kubernetes.io/audit=privileged \
+            pod-security.kubernetes.io/warn=privileged \
+            --overwrite
+
           # Split "repo:tag"; if no colon is present, default tag to "latest".
           if [[ "$IMAGE" == *:* ]]; then
             REPO="${IMAGE%:*}"
@@ -747,8 +754,23 @@ jobs:
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
 
           # Wait for the coordinator pod to complete.
-          kubectl wait "job/${JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m
+          if ! kubectl wait "job/${JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m; then
+            echo "[FAIL] Coordinator job ${JOB} did not complete within timeout"
+            echo "[diagnostic] coordinator job/pods:"
+            kubectl get "job/${JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+            echo "[diagnostic] coordinator pod logs:"
+            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
+            echo "[diagnostic] recent events in luks-trim namespace:"
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            exit 1
+          fi
+
+          echo "[diagnostic] coordinator pod logs:"
+          kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
+          echo "[diagnostic] recent events in luks-trim namespace:"
+          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
 
           echo "Coordinator complete; waiting for worker Job to appear…"
           # The coordinator creates one worker Job per node. Poll until it
@@ -776,6 +798,14 @@ jobs:
             --for=condition=complete --timeout=5m 2>/dev/null || \
           kubectl wait "job/${WORKER_JOB}" -n luks-trim \
             --for=condition=failed --timeout=30s 2>/dev/null || true
+
+          echo "[diagnostic] worker job/pods:"
+          kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+          kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+          echo "[diagnostic] worker pod logs:"
+          kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
+          echo "[diagnostic] recent events in luks-trim namespace:"
+          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
 
       - name: "[T1] Assert worker pods exited 0 and contain no [ERROR] lines"
         run: |
@@ -878,8 +908,23 @@ jobs:
           echo "job=${JOB}" >> "$GITHUB_OUTPUT"
 
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
-          kubectl wait "job/${JOB}" -n luks-trim \
-            --for=condition=complete --timeout=5m
+          if ! kubectl wait "job/${JOB}" -n luks-trim \
+            --for=condition=complete --timeout=5m; then
+            echo "[FAIL] Dry-run coordinator job ${JOB} did not complete within timeout"
+            echo "[diagnostic] dry-run coordinator job/pods:"
+            kubectl get "job/${JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
+            echo "[diagnostic] dry-run coordinator pod logs:"
+            kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
+            echo "[diagnostic] recent events in luks-trim namespace:"
+            kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+            exit 1
+          fi
+
+          echo "[diagnostic] dry-run coordinator pod logs:"
+          kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
+          echo "[diagnostic] recent events in luks-trim namespace:"
+          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
 
           # Find the worker Job created by this coordinator run.
           DEADLINE=$(( SECONDS + 60 ))
@@ -911,6 +956,14 @@ jobs:
 
           kubectl wait "job/${WORKER_JOB}" -n luks-trim \
             --for=condition=complete --timeout=5m 2>/dev/null || true
+
+          echo "[diagnostic] dry-run worker job/pods:"
+          kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+          kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+          echo "[diagnostic] dry-run worker pod logs:"
+          kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
+          echo "[diagnostic] recent events in luks-trim namespace:"
+          kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
 
       - name: "[T2] Assert [dry-run] lines present and no [ERROR] lines"
         run: |
