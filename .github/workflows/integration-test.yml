@@ -9,8 +9,8 @@
 # Key test scenarios
 # ──────────────────
 # T1  Live run  – write 2 GiB → delete → run luks-trim (enables LUKS
-#     allow-discards) → fstrim inside the pod → assert Longhorn actualSize
-#     shrank (TRIM propagated through ext4 → dm-crypt → Longhorn replica).
+#     allow-discards) → trigger Longhorn filesystem-trim recurring job →
+#     assert Longhorn actualSize shrank.
 #
 # T2  Dry-run   – verify worker logs contain [dry-run] lines, no [ERROR]
 #     lines, and Longhorn actualSize is unchanged.
@@ -557,6 +557,25 @@ jobs:
             kubectl -n longhorn-system get pods -o wide
             kubectl -n longhorn-system get deploy
 
+      - name: Create Longhorn filesystem-trim RecurringJob (dormant by default)
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: longhorn.io/v1beta2
+          kind: RecurringJob
+          metadata:
+            name: ci-filesystem-trim
+            namespace: longhorn-system
+          spec:
+            cron: "0 0 1 1 *"
+            task: "filesystem-trim"
+            groups: []
+            retain: 1
+            concurrency: 1
+            labels: {}
+          EOF
+
+          kubectl get recurringjobs.longhorn.io -n longhorn-system ci-filesystem-trim -o yaml | sed -n '1,80p'
+
       # ======================================================================
       # 5. TEST FIXTURES
       # ======================================================================
@@ -692,7 +711,8 @@ jobs:
       # 1. Write 2 GiB → assert Longhorn actualSize grew
       # 2. Delete file  → assert actualSize did NOT automatically shrink
       # 3. Run luks-trim cronjob manually
-      # 4. Assert actualSize shrank (best-effort; warn if < 1 GiB reclaimed)
+      # 4. Trigger Longhorn filesystem-trim recurring job
+      # 5. Assert actualSize shrank (hard fail if < 1 GiB reclaimed)
       # ======================================================================
 
       - name: "[T1] Write 2 GiB to encrypted volume"
@@ -898,6 +918,62 @@ jobs:
 
           echo "[PASS] Worker pod exited 0; no error lines found"
 
+      - name: "[T1] Trigger Longhorn filesystem-trim recurring job"
+        run: |
+          VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
+          JOB_NAME="ci-filesystem-trim"
+
+          # Attach recurring trim job to this specific Longhorn volume.
+          kubectl -n longhorn-system label volume.longhorn.io "${VOL_NAME}" \
+            recurring-job.longhorn.io/ci-filesystem-trim=enabled --overwrite
+
+          echo "[diagnostic] recurring job labels on ${VOL_NAME}:"
+          kubectl -n longhorn-system get volume.longhorn.io "${VOL_NAME}" \
+            -o jsonpath='{.metadata.labels}' || true
+          echo
+
+          BASE_EXEC=$(kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" \
+            -o jsonpath='{.status.executionCount}' 2>/dev/null || true)
+          echo "[diagnostic] ${JOB_NAME} executionCount before trigger: ${BASE_EXEC:-<unset>}"
+
+          # Trigger now by temporarily switching cron to every minute.
+          kubectl -n longhorn-system patch recurringjobs.longhorn.io "${JOB_NAME}" \
+            --type=merge -p '{"spec":{"cron":"* * * * *"}}'
+
+          TRIGGERED=0
+          if [[ -n "${BASE_EXEC}" ]]; then
+            echo "[diagnostic] waiting for ${JOB_NAME} executionCount to increase"
+            DEADLINE=$((SECONDS + 180))
+            while [[ $SECONDS -lt $DEADLINE ]]; do
+              CUR_EXEC=$(kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" \
+                -o jsonpath='{.status.executionCount}' 2>/dev/null || true)
+              echo "[diagnostic] current executionCount=${CUR_EXEC:-<unset>}"
+              if [[ -n "${CUR_EXEC}" ]] && [[ "${CUR_EXEC}" -gt "${BASE_EXEC}" ]]; then
+                TRIGGERED=1
+                break
+              fi
+              sleep 10
+            done
+          else
+            # Older Longhorn versions may not expose executionCount.
+            sleep 75
+            TRIGGERED=1
+          fi
+
+          # Return job to dormant schedule so it does not interfere with T2.
+          kubectl -n longhorn-system patch recurringjobs.longhorn.io "${JOB_NAME}" \
+            --type=merge -p '{"spec":{"cron":"0 0 1 1 *"}}'
+
+          if [[ "${TRIGGERED}" -ne 1 ]]; then
+            echo "[FAIL] ${JOB_NAME} did not execute within timeout"
+            kubectl -n longhorn-system get recurringjobs.longhorn.io "${JOB_NAME}" -o yaml || true
+            kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 120 || true
+            exit 1
+          fi
+
+          echo "[diagnostic] recent longhorn events after trim trigger:"
+          kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 60 || true
+
       - name: "[T1] Assert Longhorn actualSize shrank after luks-trim"
         run: |
           # Allow Longhorn replica accounting to settle after worker completion.
@@ -914,15 +990,15 @@ jobs:
           RECLAIMED=$(( PRE_TRIM - SIZE_NOW ))
           echo "Reclaimed: ${RECLAIMED} bytes"
 
-          # Expect at least 1 GiB reclaimed. If less, emit a warning rather than
-          # failing hard because reclaim timing can vary with backend behavior.
+          # Enforce reclaim expectation as a hard gate for this workflow.
           MIN_RECLAIM=$(( 1024 * 1024 * 1024 ))
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
-            echo "[WARN] Less than 1 GiB reclaimed (${RECLAIMED} bytes)."
-            echo "       Check worker logs above for trim operations and reclaim output."
-          else
-            echo "[PASS] ${RECLAIMED} bytes freed – TRIM propagated end-to-end"
+            echo "[FAIL] Less than 1 GiB reclaimed (${RECLAIMED} bytes)."
+            echo "       Expected Longhorn filesystem-trim to reclaim at least ${MIN_RECLAIM} bytes."
+            exit 1
           fi
+
+          echo "[PASS] ${RECLAIMED} bytes freed – TRIM propagated end-to-end"
 
       # ======================================================================
       # T2 — DRY-RUN
