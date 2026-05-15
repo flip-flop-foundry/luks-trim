@@ -774,10 +774,12 @@ jobs:
           fi
 
           # The chart creates the namespace with pod-security labels via the
-          # Namespace template (createNamespace=true by default). No need to
-          # pre-create or label the namespace manually.
+          # Namespace template (createNamespace=true by default). --create-namespace
+          # is still needed so Helm can create the namespace before applying
+          # templates into it; the Namespace template then updates it with labels.
           helm upgrade --install luks-trim . \
             --namespace   luks-trim \
+            --create-namespace \
             --set image.repository="${REPO}" \
             --set image.tag="${TAG}" \
             --set longhorn.enabled=true \
