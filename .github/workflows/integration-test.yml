@@ -1517,7 +1517,7 @@ jobs:
 
           run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128 true
           run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128 true
-          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 128 false
+          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 128 true
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown

@@ -149,9 +149,10 @@ data:
 
     {{- if .Values.longhorn.enabled }}
     # ── Longhorn volume processor ────────────────────────────────────────────
-    # This processor enables LUKS allow-discards on Longhorn encrypted volumes
-    # so that discard/TRIM requests from the filesystem are passed through the
-    # dm-crypt layer to the underlying storage.
+    # For Longhorn volumes:
+    #   - encrypted (LUKS): enable allow-discards via cryptsetup refresh
+    #   - unencrypted: skip key lookup (no unlock required)
+    # This keeps the worker safe for mixed storage classes.
     #
     # NOTE — fstrim is NOT run here. Longhorn itself handles periodic TRIM via
     # its own "Trim Filesystem" job. You must create and schedule that job
@@ -174,6 +175,13 @@ data:
       for _dev in "$_dev_path"/*; do
         [ -e "$_dev" ] || continue
         _name=$(basename "$_dev")
+
+        # Unencrypted Longhorn volumes do not need key lookup or LUKS refresh.
+        if ! cryptsetup isLuks "$_dev" >/dev/null 2>&1; then
+          echo "  $_name: not a LUKS device, skipping key lookup"
+          continue
+        fi
+
         if dmsetup table "$_name" 2>/dev/null | grep -q "allow_discards"; then
           echo "  $_name: allow_discards already active, skipping"; continue
         fi
