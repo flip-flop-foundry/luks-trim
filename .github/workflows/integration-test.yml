@@ -71,6 +71,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free runner disk space
+        run: |
+          echo "[info] disk usage before cleanup"
+          df -h
+
+          # Remove large, unused preinstalled toolchains from ubuntu-latest.
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+          echo "[info] disk usage after cleanup"
+          df -h
+
       # ======================================================================
       # 1. SYSTEM DEPENDENCIES
       # ======================================================================
@@ -193,9 +209,11 @@ jobs:
             exit 1
           fi
 
-          RESERVED_MIB=4096
-          MIN_DISK_MIB=8192
-          MAX_DISK_MIB=20480
+          # Keep generous host headroom so the runner can continue writing
+          # logs/artifacts while the VM disk is preallocated.
+          RESERVED_MIB=12288
+          MIN_DISK_MIB=10240
+          MAX_DISK_MIB=12288
           TALOS_DISK_MIB=$(( AVAILABLE_MIB - RESERVED_MIB ))
 
           if (( TALOS_DISK_MIB > MAX_DISK_MIB )); then
@@ -286,18 +304,17 @@ jobs:
           # runners (CNI + hypervisor setup).
           # Guard with an explicit timeout so this step cannot hang forever.
           set +e
-          timeout --signal=TERM 40m sudo -E talosctl cluster create dev \
+          timeout --signal=TERM 40m sudo --preserve-env=HOME talosctl cluster create qemu \
             --name          "$CLUSTER_NAME" \
-            --provisioner   qemu \
             --controlplanes 1 \
             --workers       0 \
-            --disk          "${TALOS_DISK_MIB}" \
-            --memory        4096 \
-            --cpus          "2.0" \
+            --disks         "virtio:${TALOS_DISK_MIB}MiB" \
+            --memory-controlplanes "4096MiB" \
+            --cpus-controlplanes   "2.0" \
             --talos-version "v${TALOS_VERSION}" \
-            --config-patch-control-plane @/tmp/mc-patch.yaml \
-            --wait \
-            --wait-timeout  30m
+            --schematic-id  "${SCHEMATIC_ID}" \
+            --config-patch-controlplanes @/tmp/mc-patch.yaml \
+            --talosconfig-destination "$TALOSCONFIG"
           CREATE_RC=$?
           set -e
 
@@ -313,29 +330,15 @@ jobs:
             exit "${CREATE_RC}"
           fi
 
-          # Export configs to workspace paths consumed by later steps.
-          # Depending on sudo HOME behavior, Talos state may land in either
-          # ${HOME}/.talos or /root/.talos.
-          RUNNER_TALOS_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
-          ROOT_TALOS_DIR="/root/.talos/clusters/${CLUSTER_NAME}"
-          if [[ -f "${RUNNER_TALOS_DIR}/talosconfig" ]]; then
-            TALOS_STATE_DIR="${RUNNER_TALOS_DIR}"
-          elif sudo test -f "${ROOT_TALOS_DIR}/talosconfig"; then
-            TALOS_STATE_DIR="${ROOT_TALOS_DIR}"
-          else
-            echo "[FAIL] Expected talosconfig not found in either candidate path"
-            echo "[diagnostic] checked: ${RUNNER_TALOS_DIR}/talosconfig"
-            echo "[diagnostic] checked: ${ROOT_TALOS_DIR}/talosconfig"
+          # Export kubeconfig to the workspace path consumed by later steps.
+          # qemu create writes talosconfig directly to $TALOSCONFIG.
+          if [[ ! -f "$TALOSCONFIG" ]]; then
+            echo "[FAIL] Expected talosconfig not found at ${TALOSCONFIG}"
             exit 1
           fi
 
-          echo "[info] using Talos state dir: ${TALOS_STATE_DIR}"
-
-          sudo cp "${TALOS_STATE_DIR}/talosconfig" "$TALOSCONFIG"
-          sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
-
-          sudo -E talosctl \
-            --talosconfig "${TALOS_STATE_DIR}/talosconfig" \
+          talosctl \
+            --talosconfig "$TALOSCONFIG" \
             kubeconfig --merge=false /tmp/kubeconfig
           sudo cp /tmp/kubeconfig "$KUBECONFIG"
           sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
