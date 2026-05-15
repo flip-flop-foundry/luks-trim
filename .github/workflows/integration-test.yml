@@ -1302,47 +1302,111 @@ jobs:
           echo "[PASS] actualSize stable during dry run (delta: ${DELTA} bytes)"
 
       # ======================================================================
-      # T3 — STORAGECLASS COVERAGE (smoke)
+      # T3 — T1-STYLE RECLAIM COVERAGE ACROSS REMAINING STORAGE CLASSES
       #
-      # Add baseline coverage for all supported Longhorn StorageClasses without
-      # changing the established T1/T2 flow.
+      # Keep one shared cluster, then run a reusable T1-like flow sequentially
+      # for ns-key, pvc-key, and plain classes:
+      #   create PVC/pod -> write -> delete -> run luks-trim -> trigger
+      #   Longhorn filesystem-trim -> assert reclaim behavior.
       # ======================================================================
 
-      - name: "[T3] Create PVCs and pods for ns/pvc/plain classes"
+      - name: "[T3] Run T1-style reclaim flow for ns/pvc/plain classes"
         run: |
-          kubectl apply -f - <<'EOF'
+          trigger_longhorn_trim_job() {
+            local case_label="$1"
+            local cronjob_name="ci-filesystem-trim"
+            local trigger_job="${cronjob_name}-${case_label}-$(date +%s)"
+
+            kubectl -n longhorn-system create job "${trigger_job}" --from=cronjob/"${cronjob_name}"
+
+            if ! kubectl -n longhorn-system wait --for=condition=complete "job/${trigger_job}" --timeout=5m; then
+              echo "[FAIL] Longhorn trim job ${trigger_job} did not complete"
+              kubectl -n longhorn-system get "job/${trigger_job}" -o wide || true
+              kubectl -n longhorn-system get pods -l "job-name=${trigger_job}" -o wide || true
+              kubectl -n longhorn-system logs -l "job-name=${trigger_job}" --tail=-1 || true
+              return 1
+            fi
+          }
+
+          run_luks_trim_and_assert_worker() {
+            local case_label="$1"
+            local coord_job="luks-trim-${case_label}-$(date +%s)"
+            local prev_jobs=""
+            local worker_job=""
+
+            prev_jobs=$(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
+            kubectl create job "${coord_job}" --from=cronjob/luks-trim -n luks-trim
+
+            if ! kubectl wait -n luks-trim --for=condition=complete "job/${coord_job}" --timeout=5m; then
+              echo "[FAIL] Coordinator ${coord_job} did not complete"
+              kubectl get "job/${coord_job}" -n luks-trim -o wide || true
+              kubectl logs -n luks-trim -l "job-name=${coord_job}" --tail=-1 || true
+              kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
+              return 1
+            fi
+
+            local deadline=$(( SECONDS + 60 ))
+            until [[ $SECONDS -ge $deadline ]]; do
+              for new_job in $(kubectl get jobs -n luks-trim \
+                -l "luks-trim/role=worker" \
+                --sort-by='.metadata.creationTimestamp' \
+                -o name 2>/dev/null | sed 's|job.batch/||'); do
+                if ! echo "$prev_jobs" | grep -qF "job.batch/${new_job}"; then
+                  worker_job="$new_job"
+                fi
+              done
+              [[ -n "$worker_job" ]] && break
+              sleep 3
+            done
+
+            if [[ -z "$worker_job" ]]; then
+              echo "[FAIL] No new worker job found for case ${case_label}"
+              kubectl get jobs -n luks-trim -l "luks-trim/role=worker" -o wide || true
+              return 1
+            fi
+
+            if ! kubectl wait -n luks-trim --for=condition=complete "job/${worker_job}" --timeout=5m; then
+              echo "[FAIL] Worker ${worker_job} did not complete"
+              kubectl get "job/${worker_job}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o wide || true
+              kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 || true
+              return 1
+            fi
+
+            local logs
+            logs=$(kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 2>/dev/null)
+            local error_count
+            error_count=$(echo "$logs" | grep -c '\[ERROR\]' || true)
+            if [[ "$error_count" -gt 0 ]]; then
+              echo "[FAIL] Worker ${worker_job} emitted [ERROR] lines"
+              echo "$logs" | grep '\[ERROR\]' || true
+              return 1
+            fi
+
+            echo "[PASS] ${case_label}: worker ${worker_job} completed with no [ERROR]"
+          }
+
+          run_case() {
+            local case_label="$1"
+            local storage_class="$2"
+            local pvc_name="$3"
+            local pod_name="$4"
+            local write_mib="$5"
+            local min_reclaim_mib="$6"
+
+            echo "===== [T3:${case_label}] storageClass=${storage_class} pvc=${pvc_name} ====="
+
+            kubectl apply -f - <<EOF
           apiVersion: v1
           kind: PersistentVolumeClaim
           metadata:
-            name: t3-ns-vol
+            name: ${pvc_name}
             namespace: luks-trim-test
           spec:
             accessModes: [ReadWriteOnce]
-            storageClassName: luks-ns-key
-            resources:
-              requests:
-                storage: 512Mi
-          ---
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: t3-pvc-vol
-            namespace: luks-trim-test
-          spec:
-            accessModes: [ReadWriteOnce]
-            storageClassName: luks-pvc-key
-            resources:
-              requests:
-                storage: 512Mi
-          ---
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: t3-plain-vol
-            namespace: luks-trim-test
-          spec:
-            accessModes: [ReadWriteOnce]
-            storageClassName: no-encryption
+            storageClassName: ${storage_class}
             resources:
               requests:
                 storage: 512Mi
@@ -1350,7 +1414,7 @@ jobs:
           apiVersion: v1
           kind: Pod
           metadata:
-            name: t3-ns-filler
+            name: ${pod_name}
             namespace: luks-trim-test
           spec:
             containers:
@@ -1363,72 +1427,68 @@ jobs:
             volumes:
               - name: data
                 persistentVolumeClaim:
-                  claimName: t3-ns-vol
-            restartPolicy: Never
-          ---
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: t3-pvc-filler
-            namespace: luks-trim-test
-          spec:
-            containers:
-              - name: filler
-                image: ubuntu:24.04
-                command: ["sleep", "3600"]
-                volumeMounts:
-                  - name: data
-                    mountPath: /data
-            volumes:
-              - name: data
-                persistentVolumeClaim:
-                  claimName: t3-pvc-vol
-            restartPolicy: Never
-          ---
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: t3-plain-filler
-            namespace: luks-trim-test
-          spec:
-            containers:
-              - name: filler
-                image: ubuntu:24.04
-                command: ["sleep", "3600"]
-                volumeMounts:
-                  - name: data
-                    mountPath: /data
-            volumes:
-              - name: data
-                persistentVolumeClaim:
-                  claimName: t3-plain-vol
+                  claimName: ${pvc_name}
             restartPolicy: Never
           EOF
 
-          kubectl wait pod/t3-ns-filler -n luks-trim-test --for=condition=Ready --timeout=5m
-          kubectl wait pod/t3-pvc-filler -n luks-trim-test --for=condition=Ready --timeout=5m
-          kubectl wait pod/t3-plain-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+            kubectl wait pod/"${pod_name}" -n luks-trim-test --for=condition=Ready --timeout=5m
 
-      - name: "[T3] Assert PVCs are bound across all classes"
-        run: |
-          for PVC in test-vol t3-ns-vol t3-pvc-vol t3-plain-vol; do
-            PHASE=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.status.phase}')
-            SC=$(kubectl get pvc "${PVC}" -n luks-trim-test -o jsonpath='{.spec.storageClassName}')
-            echo "${PVC}: phase=${PHASE} storageClass=${SC}"
-            if [[ "${PHASE}" != "Bound" ]]; then
-              echo "[FAIL] PVC ${PVC} is not Bound"
-              kubectl describe pvc "${PVC}" -n luks-trim-test || true
-              exit 1
+            kubectl exec "${pod_name}" -n luks-trim-test -- \
+              dd if=/dev/urandom of=/data/t3-file.bin bs=1M count="${write_mib}" status=none
+            kubectl exec "${pod_name}" -n luks-trim-test -- sync
+            sleep 10
+
+            local vol_name
+            vol_name=$(kubectl get pvc "${pvc_name}" -n luks-trim-test -o jsonpath='{.spec.volumeName}')
+            local size_after_write
+            size_after_write=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+            local write_floor=$(( write_mib * 1024 * 1024 * 70 / 100 ))
+            if [[ "${size_after_write}" -lt "${write_floor}" ]]; then
+              echo "[FAIL] ${case_label}: actualSize ${size_after_write} below floor ${write_floor} after write"
+              return 1
             fi
-          done
 
-      - name: "[T3] Smoke write/read for ns/pvc/plain classes"
-        run: |
-          for POD in t3-ns-filler t3-pvc-filler t3-plain-filler; do
-            echo "[diagnostic] smoke write/read in ${POD}"
-            kubectl exec "${POD}" -n luks-trim-test -- \
-              sh -c 'dd if=/dev/urandom of=/data/t3-smoke.bin bs=1M count=64 status=none && sync && test -s /data/t3-smoke.bin && wc -c /data/t3-smoke.bin'
-          done
+            kubectl exec "${pod_name}" -n luks-trim-test -- rm /data/t3-file.bin
+            kubectl exec "${pod_name}" -n luks-trim-test -- sync
+            sleep 10
+
+            local pre_trim
+            pre_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+
+            run_luks_trim_and_assert_worker "${case_label}"
+            trigger_longhorn_trim_job "${case_label}"
+            sleep 20
+
+            local post_trim
+            post_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+            local reclaimed=$(( pre_trim - post_trim ))
+            local min_reclaim_bytes=$(( min_reclaim_mib * 1024 * 1024 ))
+
+            echo "[diagnostic] ${case_label}: pre=${pre_trim} post=${post_trim} reclaimed=${reclaimed}"
+
+            if [[ "${min_reclaim_mib}" -gt 0 ]]; then
+              if [[ "${reclaimed}" -lt "${min_reclaim_bytes}" ]]; then
+                echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
+                return 1
+              fi
+            else
+              if [[ "${post_trim}" -gt "${pre_trim}" ]]; then
+                echo "[FAIL] ${case_label}: post-trim size grew (${post_trim} > ${pre_trim})"
+                return 1
+              fi
+            fi
+
+            kubectl delete pod "${pod_name}" -n luks-trim-test --ignore-not-found=true
+            kubectl delete pvc "${pvc_name}" -n luks-trim-test --ignore-not-found=true
+            kubectl wait --for=delete pod/"${pod_name}" -n luks-trim-test --timeout=3m || true
+            kubectl wait --for=delete pvc/"${pvc_name}" -n luks-trim-test --timeout=3m || true
+
+            echo "[PASS] ${case_label}: T1-style reclaim flow passed"
+          }
+
+          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128
+          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128
+          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 0
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown
