@@ -434,6 +434,10 @@ jobs:
             exit 1
           fi
 
+          # qemu create runs via sudo and may leave talosconfig unreadable by
+          # the runner user; normalize ownership before using it.
+          sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
+
           talosctl \
             --talosconfig "$TALOSCONFIG" \
             kubeconfig --merge=false /tmp/kubeconfig
