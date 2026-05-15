@@ -33,12 +33,12 @@ RUN set -eux; \
     esac; \
     TAR="grpcurl_${GRPCURL_VERSION}_linux_${GA}.tar.gz"; \
     BASE_URL="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}"; \
-    curl -fsSL "${BASE_URL}/${TAR}"          -o /tmp/grpcurl.tar.gz; \
-    curl -fsSL "${BASE_URL}/checksums.txt"   -o /tmp/checksums.txt; \
-    grep "${TAR}" /tmp/checksums.txt | sha256sum -c -; \
-    tar -xz -C /usr/local/bin -f /tmp/grpcurl.tar.gz grpcurl; \
+    curl -fsSL "${BASE_URL}/${TAR}"          -o "/tmp/${TAR}"; \
+    curl -fsSL "${BASE_URL}/grpcurl_${GRPCURL_VERSION}_checksums.txt"   -o /tmp/checksums.txt; \
+    awk -v tar="${TAR}" '$2 == tar { print $1 "  /tmp/" tar }' /tmp/checksums.txt | sha256sum -c -; \
+    tar -xz -C /usr/local/bin -f "/tmp/${TAR}" grpcurl; \
     chmod +x /usr/local/bin/grpcurl; \
-    rm -f /tmp/grpcurl.tar.gz /tmp/checksums.txt; \
+    rm -f "/tmp/${TAR}" /tmp/checksums.txt; \
     grpcurl --version
 
 # Smoke-test that all required binaries are present and executable.
@@ -50,3 +50,4 @@ RUN fstrim --version && \
     grpcurl --version
 
 USER root
+
