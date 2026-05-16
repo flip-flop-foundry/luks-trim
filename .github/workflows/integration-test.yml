@@ -20,6 +20,12 @@
 # T2  Dry-run   – verify worker logs contain [dry-run] lines, no [ERROR]
 #     lines, and Longhorn actualSize is unchanged.
 #
+# T3  T1-style reclaim checks for remaining storage classes (ns/pvc/plain).
+#
+# T4  Talos encrypted uservolume + Longhorn disk path on /var/mnt/<name>:
+#     confirm replica placement on the uservolume, then run T1-style reclaim
+#     with both luks-trim (talos + longhorn paths) and Longhorn trim trigger.
+#
 # Trigger: workflow_dispatch only (not automated; QEMU cluster takes ~30 min).
 # To gate PRs, add a `pull_request` trigger once the cluster setup time is
 # acceptable for your CI budget.
@@ -58,6 +64,9 @@ concurrency:
 
 env:
   CLUSTER_NAME: luks-trim-test
+  TALOS_USERVOLUME_NAME: longhorn-uvol
+  TALOS_USERVOLUME_STATIC_PASSPHRASE: ci-talos-uservolume-static-passphrase
+  TALOS_USERVOLUME_LONGHORN_PATH: /var/mnt/longhorn-uvol/longhorn
   # These paths are written by the cluster-create step and consumed by later
   # steps via the TALOSCONFIG / KUBECONFIG env vars picked up automatically
   # by talosctl / kubectl.
@@ -169,8 +178,8 @@ jobs:
       #
       # The machine config patch injects:
       #   • machine.install.image  → factory installer with extensions
-      #   • machine.files          → iSCSI initiator name (required by Longhorn)
       #   • cluster.allowSchedulingOnControlPlanes → removes NoSchedule taint
+      #   • encrypted Talos UserVolumeConfig (static key) for /var/mnt/<name>
       # ======================================================================
 
       - name: Create Talos QEMU cluster
@@ -184,6 +193,22 @@ jobs:
           machine:
             install:
               image: factory.talos.dev/installer/${SCHEMATIC_ID}:v${TALOS_VERSION}
+          ---
+          apiVersion: v1alpha1
+          kind: UserVolumeConfig
+          name: ${TALOS_USERVOLUME_NAME}
+          provisioning:
+            diskSelector:
+              match: disk.transport == 'virtio'
+            minSize: 2GB
+            maxSize: 2GB
+          encryption:
+            provider: luks2
+            keys:
+              - static:
+                  passphrase: ${TALOS_USERVOLUME_STATIC_PASSPHRASE}
+                slot: 0
+                lockToState: true
           EOF
 
           AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
@@ -459,6 +484,33 @@ jobs:
         run: |
           kubectl wait node --all --for=condition=Ready --timeout=10m
           kubectl get nodes -o wide
+
+      - name: Verify Talos encrypted uservolume is ready
+        run: |
+          VOL_ID="u-${TALOS_USERVOLUME_NAME}"
+
+          echo "[info] VolumeStatus for ${VOL_ID}:"
+          talosctl get volumestatus "${VOL_ID}" -o yaml
+
+          VOL_YAML=$(talosctl get volumestatus "${VOL_ID}" -o yaml)
+          if ! echo "${VOL_YAML}" | grep -qi 'phase: ready'; then
+            echo "[FAIL] Talos uservolume ${VOL_ID} is not ready"
+            exit 1
+          fi
+
+          echo "[info] MountStatus for ${VOL_ID}:"
+          MOUNT_YAML=$(talosctl get mountstatus "${VOL_ID}" -o yaml)
+          echo "${MOUNT_YAML}"
+
+          if ! echo "${MOUNT_YAML}" | grep -q "target: /var/mnt/${TALOS_USERVOLUME_NAME}"; then
+            echo "[FAIL] Talos uservolume mount target /var/mnt/${TALOS_USERVOLUME_NAME} not found"
+            exit 1
+          fi
+
+          if ! echo "${MOUNT_YAML}" | grep -q "source: /dev/mapper/luks2-"; then
+            echo "[FAIL] Talos uservolume source is not a luks2 mapper device"
+            exit 1
+          fi
 
       # ======================================================================
       # 4. INSTALL LONGHORN
@@ -1719,6 +1771,311 @@ jobs:
           run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128 true
           run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128 true
           run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 128 true
+
+      # ======================================================================
+      # T4 — TALOS ENCRYPTED USERVOLUME AS LONGHORN DISK PATH
+      #
+      # 1. Add /var/mnt/<uservol>/longhorn as a tagged Longhorn disk.
+      # 2. Create a StorageClass pinned to that disk tag.
+      # 3. Enable talos static-key path in the chart.
+      # 4. Run T1-style flow: write -> delete -> luks-trim -> Longhorn trim.
+      # 5. Assert replica placement is on the Talos uservolume path.
+      # 6. Assert Longhorn actualSize shrank after trim triggers.
+      # ======================================================================
+
+      - name: "[T4] Prepare uservolume-backed Longhorn disk and StorageClass"
+        run: |
+          NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          if [[ -z "${NODE_NAME}" ]]; then
+            echo "[FAIL] Could not determine Kubernetes node name"
+            exit 1
+          fi
+
+          echo "[info] using node: ${NODE_NAME}"
+
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t4-uservol-probe
+            namespace: longhorn-system
+          spec:
+            nodeName: ${NODE_NAME}
+            restartPolicy: Never
+            containers:
+              - name: probe
+                image: ubuntu:24.04
+                securityContext:
+                  privileged: true
+                command: ["/bin/bash", "-ec"]
+                args:
+                  - |
+                    mkdir -p /host-uservol/longhorn
+                    echo "[info] host uservolume filesystem:"
+                    df -h /host-uservol || true
+                    stat -f -c 'fs_type=%T block_size=%S' /host-uservol || true
+                volumeMounts:
+                  - name: uservol
+                    mountPath: /host-uservol
+            volumes:
+              - name: uservol
+                hostPath:
+                  path: /var/mnt/${TALOS_USERVOLUME_NAME}
+                  type: Directory
+          EOF
+
+          if ! kubectl wait -n longhorn-system --for=condition=Ready pod/t4-uservol-probe --timeout=5m; then
+            echo "[FAIL] t4-uservol-probe pod was not Ready"
+            kubectl -n longhorn-system describe pod t4-uservol-probe || true
+            exit 1
+          fi
+
+          kubectl logs -n longhorn-system t4-uservol-probe --tail=-1 || true
+          kubectl delete pod t4-uservol-probe -n longhorn-system --ignore-not-found=true
+          kubectl wait --for=delete pod/t4-uservol-probe -n longhorn-system --timeout=3m || true
+
+          PATCH=$(cat <<EOF
+          {"spec":{"disks":{"talos-uservol":{"path":"${TALOS_USERVOLUME_LONGHORN_PATH}","allowScheduling":true,"storageReserved":0,"tags":["talos-uservol"]}}}}
+          EOF
+          )
+          kubectl patch nodes.longhorn.io "${NODE_NAME}" -n longhorn-system --type merge -p "${PATCH}"
+
+          DEADLINE=$(( SECONDS + 180 ))
+          while [[ $SECONDS -lt $DEADLINE ]]; do
+            DISK_READY=$(kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o json \
+              | jq -r '.status.diskStatus["talos-uservol"].conditions.Schedulable.status // empty')
+            if [[ "${DISK_READY}" == "true" || "${DISK_READY}" == "True" ]]; then
+              break
+            fi
+            echo "[monitor] waiting for Longhorn disk talos-uservol to become schedulable"
+            sleep 6
+          done
+
+          DISK_READY=$(kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o json \
+            | jq -r '.status.diskStatus["talos-uservol"].conditions.Schedulable.status // empty')
+          if [[ "${DISK_READY}" != "true" && "${DISK_READY}" != "True" ]]; then
+            echo "[FAIL] Longhorn disk talos-uservol was not schedulable"
+            kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o yaml
+            exit 1
+          fi
+
+          kubectl apply -f - <<'EOF'
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: talos-uservol-no-encryption
+          provisioner: driver.longhorn.io
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+          parameters:
+            numberOfReplicas: "1"
+            staleReplicaTimeout: "2880"
+            fromBackup: ""
+            fsType: ext4
+            encrypted: "false"
+            diskSelector: "talos-uservol"
+          EOF
+
+      - name: "[T4] Enable Talos static-key trim path"
+        run: |
+          kubectl create secret generic talos-static-key \
+            --namespace luks-trim \
+            --from-literal=passphrase="${TALOS_USERVOLUME_STATIC_PASSPHRASE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set talos.enabled=true \
+            --set talos.staticKey.enabled=true \
+            --set talos.staticKey.secretNamespace=luks-trim \
+            --set talos.staticKey.secretName=talos-static-key \
+            --set talos.staticKey.secretKey=passphrase
+
+      - name: "[T4] Run T1-style reclaim flow on Talos uservolume-backed Longhorn volume"
+        run: |
+          run_luks_trim_and_assert_worker() {
+            local case_label="$1"
+            local coord_job="luks-trim-${case_label}-$(date +%s)"
+            local prev_jobs=""
+            local worker_job=""
+
+            prev_jobs=$(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
+            kubectl create job "${coord_job}" --from=cronjob/luks-trim -n luks-trim
+
+            if ! kubectl wait -n luks-trim --for=condition=complete "job/${coord_job}" --timeout=5m; then
+              echo "[FAIL] Coordinator ${coord_job} did not complete"
+              kubectl get "job/${coord_job}" -n luks-trim -o wide || true
+              kubectl logs -n luks-trim -l "job-name=${coord_job}" --tail=-1 || true
+              return 1
+            fi
+
+            local deadline=$(( SECONDS + 60 ))
+            until [[ $SECONDS -ge $deadline ]]; do
+              for new_job in $(kubectl get jobs -n luks-trim \
+                -l "luks-trim/role=worker" \
+                --sort-by='.metadata.creationTimestamp' \
+                -o name 2>/dev/null | sed 's|job.batch/||'); do
+                if ! echo "$prev_jobs" | grep -qF "job.batch/${new_job}"; then
+                  worker_job="$new_job"
+                fi
+              done
+              [[ -n "$worker_job" ]] && break
+              sleep 3
+            done
+
+            if [[ -z "$worker_job" ]]; then
+              echo "[FAIL] No new worker job found for case ${case_label}"
+              kubectl get jobs -n luks-trim -l "luks-trim/role=worker" -o wide || true
+              return 1
+            fi
+
+            if ! kubectl wait -n luks-trim --for=condition=complete "job/${worker_job}" --timeout=5m; then
+              echo "[FAIL] Worker ${worker_job} did not complete"
+              kubectl get "job/${worker_job}" -n luks-trim -o wide || true
+              kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o wide || true
+              kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 || true
+              return 1
+            fi
+
+            WORKER_LOGS=$(kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 2>/dev/null)
+            ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
+            if [[ "$ERROR_COUNT" -gt 0 ]]; then
+              echo "[FAIL] Worker ${worker_job} emitted [ERROR] lines"
+              echo "$WORKER_LOGS" | grep '\[ERROR\]' || true
+              return 1
+            fi
+
+            if ! echo "$WORKER_LOGS" | grep -q "Checking Talos LUKS volumes"; then
+              echo "[FAIL] Worker ${worker_job} did not run Talos volume path"
+              echo "$WORKER_LOGS"
+              return 1
+            fi
+
+            if ! echo "$WORKER_LOGS" | grep -q "luks2-"; then
+              echo "[FAIL] Worker ${worker_job} did not discover any Talos /dev/mapper/luks2-* volumes"
+              echo "$WORKER_LOGS"
+              return 1
+            fi
+
+            if ! echo "$WORKER_LOGS" | grep -q "talos-static:\|allow_discards already active"; then
+              echo "[FAIL] Worker ${worker_job} did not log static-key Talos processing"
+              echo "$WORKER_LOGS"
+              return 1
+            fi
+          }
+
+          trigger_longhorn_trim_job() {
+            local case_label="$1"
+            local cronjob_name="ci-filesystem-trim"
+            local trigger_job="${cronjob_name}-${case_label}-$(date +%s)"
+
+            kubectl -n longhorn-system create job "${trigger_job}" --from=cronjob/"${cronjob_name}"
+
+            if ! kubectl -n longhorn-system wait --for=condition=complete "job/${trigger_job}" --timeout=5m; then
+              echo "[FAIL] Longhorn trim job ${trigger_job} did not complete"
+              kubectl -n longhorn-system get "job/${trigger_job}" -o wide || true
+              kubectl -n longhorn-system logs -l "job-name=${trigger_job}" --tail=-1 || true
+              return 1
+            fi
+          }
+
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: t4-talos-uservol-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: talos-uservol-no-encryption
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t4-talos-uservol-filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: t4-talos-uservol-vol
+            restartPolicy: Never
+          EOF
+
+          kubectl wait pod/t4-talos-uservol-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+
+          VOL_NAME=$(kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}')
+          if [[ -z "${VOL_NAME}" ]]; then
+            echo "[FAIL] Could not resolve Longhorn volume name for T4 PVC"
+            exit 1
+          fi
+
+          REPLICA_DISK_PATH=$(kubectl get replicas.longhorn.io -n longhorn-system -o json \
+            | jq -r --arg vol "${VOL_NAME}" '.items[] | select(.spec.volumeName == $vol) | .spec.diskPath' \
+            | head -1)
+          echo "[info] T4 replica disk path: ${REPLICA_DISK_PATH}"
+
+          if [[ -z "${REPLICA_DISK_PATH}" ]]; then
+            echo "[FAIL] Could not find Longhorn replica for volume ${VOL_NAME}"
+            kubectl get replicas.longhorn.io -n longhorn-system -o wide || true
+            exit 1
+          fi
+
+          if [[ "${REPLICA_DISK_PATH}" != "${TALOS_USERVOLUME_LONGHORN_PATH}"* ]]; then
+            echo "[FAIL] Replica path ${REPLICA_DISK_PATH} is not on Talos uservolume path ${TALOS_USERVOLUME_LONGHORN_PATH}"
+            exit 1
+          fi
+
+          kubectl exec t4-talos-uservol-filler -n luks-trim-test -- \
+            dd if=/dev/urandom of=/data/t4-file.bin bs=1M count=512 status=none
+          kubectl exec t4-talos-uservol-filler -n luks-trim-test -- sync
+          sleep 10
+
+          SIZE_AFTER_WRITE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+          WRITE_FLOOR=$(( 512 * 1024 * 1024 * 70 / 100 ))
+          if [[ "${SIZE_AFTER_WRITE}" -lt "${WRITE_FLOOR}" ]]; then
+            echo "[FAIL] actualSize ${SIZE_AFTER_WRITE} is below floor ${WRITE_FLOOR} after write"
+            exit 1
+          fi
+
+          kubectl exec t4-talos-uservol-filler -n luks-trim-test -- rm /data/t4-file.bin
+          kubectl exec t4-talos-uservol-filler -n luks-trim-test -- sync
+          sleep 10
+
+          PRE_TRIM=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+
+          run_luks_trim_and_assert_worker "t4-talos-uservol"
+          trigger_longhorn_trim_job "t4-talos-uservol"
+
+          sleep 20
+          POST_TRIM=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+          RECLAIMED=$(( PRE_TRIM - POST_TRIM ))
+          MIN_RECLAIM=$(( 128 * 1024 * 1024 ))
+
+          echo "[info] T4 pre-trim=${PRE_TRIM} post-trim=${POST_TRIM} reclaimed=${RECLAIMED}"
+          if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
+            echo "[FAIL] T4 reclaimed ${RECLAIMED} bytes (< ${MIN_RECLAIM})"
+            exit 1
+          fi
+
+          kubectl delete pod t4-talos-uservol-filler -n luks-trim-test --ignore-not-found=true
+          kubectl delete pvc t4-talos-uservol-vol -n luks-trim-test --ignore-not-found=true
+          kubectl wait --for=delete pod/t4-talos-uservol-filler -n luks-trim-test --timeout=3m || true
+          kubectl wait --for=delete pvc/t4-talos-uservol-vol -n luks-trim-test --timeout=3m || true
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown
