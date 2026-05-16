@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 460" role="img" aria-labelledby="title desc">
+  <title id="title">Nested allocation problem without trim</title>
+  <desc id="desc">Logical file usage drops after delete, but Longhorn, Talos, and VM disk allocation stay high without trim/discard propagation.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #0b1220; }
+      .panel { fill: #111b2e; stroke: #4b5a7a; stroke-width: 2; rx: 12; }
+      .cap { fill: #2a3958; }
+      .label { fill: #d7e3ff; font: 700 18px 'Segoe UI', Tahoma, sans-serif; }
+      .small { fill: #a8b9df; font: 600 14px 'Segoe UI', Tahoma, sans-serif; }
+      .warn { fill: #ffd87a; font: 700 16px 'Segoe UI', Tahoma, sans-serif; }
+      .alloc { fill: #ff9f43; opacity: 0.95; }
+      .logical { fill: #4dd2ff; }
+      .arrow { stroke: #8ea3d1; stroke-width: 2; marker-end: url(#arrowhead); }
+      .phase { fill: #d7e3ff; font: 700 17px 'Segoe UI', Tahoma, sans-serif; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#8ea3d1" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="980" height="460" rx="16" />
+
+  <text class="label" x="30" y="38">Without TRIM: delete removes files, not allocation</text>
+
+  <text class="phase" x="30" y="72" opacity="1">Phase 1/3: write files (+4 GiB)
+    <animate attributeName="opacity" values="1;0;0;1" keyTimes="0;0.34;0.67;1" calcMode="discrete" dur="10s" repeatCount="indefinite" />
+  </text>
+  <text class="phase" x="30" y="72" opacity="0">Phase 2/3: delete files (-4 GiB)
+    <animate attributeName="opacity" values="0;1;0;0" keyTimes="0;0.34;0.67;1" calcMode="discrete" dur="10s" repeatCount="indefinite" />
+  </text>
+  <text class="phase" x="30" y="72" opacity="0">Phase 3/3: no trim, lower layers stay allocated
+    <animate attributeName="opacity" values="0;0;1;0" keyTimes="0;0.34;0.67;1" calcMode="discrete" dur="10s" repeatCount="indefinite" />
+  </text>
+
+  <rect class="panel" x="30" y="100" width="920" height="330" />
+
+  <text class="small" x="70" y="142">Logical filesystem usage (inside volume)</text>
+  <rect x="70" y="156" width="840" height="34" rx="8" fill="#1e2a42" stroke="#455a85" />
+  <rect class="logical" x="72" y="158" width="120" height="30" rx="7">
+    <animate attributeName="width" values="120;700;120" keyTimes="0;0.35;1" dur="10s" repeatCount="indefinite" />
+  </rect>
+
+  <line class="arrow" x1="490" y1="196" x2="490" y2="225" />
+  <line class="arrow" x1="490" y1="275" x2="490" y2="304" />
+  <line class="arrow" x1="490" y1="354" x2="490" y2="383" />
+
+  <g transform="translate(70,228)">
+    <text class="small" x="0" y="-8">Longhorn volume allocation</text>
+    <rect x="0" y="0" width="840" height="38" rx="8" fill="#1e2a42" stroke="#455a85" />
+    <rect class="alloc" x="2" y="2" width="120" height="34" rx="7">
+      <animate attributeName="width" values="120;700;700" keyTimes="0;0.35;1" dur="10s" repeatCount="indefinite" />
+    </rect>
+  </g>
+
+  <g transform="translate(70,307)">
+    <text class="small" x="0" y="-8">Talos encrypted system allocation</text>
+    <rect x="0" y="0" width="840" height="38" rx="8" fill="#1e2a42" stroke="#455a85" />
+    <rect class="alloc" x="2" y="2" width="120" height="34" rx="7" opacity="0.88">
+      <animate attributeName="width" values="120;700;700" keyTimes="0;0.35;1" dur="10s" repeatCount="indefinite" />
+    </rect>
+  </g>
+
+  <g transform="translate(70,386)">
+    <text class="small" x="0" y="-8">VM host disk allocation (qcow2/raw sparse)</text>
+    <rect x="0" y="0" width="840" height="38" rx="8" fill="#1e2a42" stroke="#455a85" />
+    <rect class="alloc" x="2" y="2" width="120" height="34" rx="7" opacity="0.82">
+      <animate attributeName="width" values="120;700;700" keyTimes="0;0.35;1" dur="10s" repeatCount="indefinite" />
+    </rect>
+  </g>
+
+  <text class="warn" x="520" y="90">Delete happened, allocation did not drop</text>
+  <circle cx="500" cy="84" r="5" fill="#ffd87a">
+    <animate attributeName="opacity" values="0;0;1;1;0.3;1" keyTimes="0;0.6;0.66;0.9;0.95;1" dur="10s" repeatCount="indefinite" />
+  </circle>
+</svg>
