@@ -203,7 +203,7 @@ jobs:
           provisioning:
             diskSelector:
               match: disk.transport == 'virtio'
-            maxSize: 6GB
+            maxSize: "50%"
           ---
           apiVersion: v1alpha1
           kind: UserVolumeConfig
@@ -211,8 +211,8 @@ jobs:
           provisioning:
             diskSelector:
               match: disk.transport == 'virtio'
-            minSize: 256MB
-            maxSize: 256MB
+            minSize: 100MB
+            maxSize: 100MB
           encryption:
             provider: luks2
             keys:
@@ -2048,7 +2048,7 @@ jobs:
             storageClassName: talos-uservol-no-encryption
             resources:
               requests:
-                storage: 128Mi
+                storage: 64Mi
           ---
           apiVersion: v1
           kind: Pod
@@ -2095,12 +2095,12 @@ jobs:
           fi
 
           kubectl exec t4-talos-uservol-filler -n luks-trim-test -- \
-            dd if=/dev/urandom of=/data/t4-file.bin bs=1M count=64 status=none
+            dd if=/dev/urandom of=/data/t4-file.bin bs=1M count=32 status=none
           kubectl exec t4-talos-uservol-filler -n luks-trim-test -- sync
           sleep 10
 
           SIZE_AFTER_WRITE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
-          WRITE_FLOOR=$(( 64 * 1024 * 1024 * 70 / 100 ))
+          WRITE_FLOOR=$(( 32 * 1024 * 1024 * 70 / 100 ))
           if [[ "${SIZE_AFTER_WRITE}" -lt "${WRITE_FLOOR}" ]]; then
             echo "[FAIL] actualSize ${SIZE_AFTER_WRITE} is below floor ${WRITE_FLOOR} after write"
             exit 1
@@ -2118,7 +2118,7 @@ jobs:
           sleep 20
           POST_TRIM=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
           RECLAIMED=$(( PRE_TRIM - POST_TRIM ))
-          MIN_RECLAIM=$(( 16 * 1024 * 1024 ))
+          MIN_RECLAIM=$(( 8 * 1024 * 1024 ))
 
           echo "[info] T4 pre-trim=${PRE_TRIM} post-trim=${POST_TRIM} reclaimed=${RECLAIMED}"
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
