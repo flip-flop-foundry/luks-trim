@@ -211,8 +211,8 @@ jobs:
           provisioning:
             diskSelector:
               match: disk.transport == 'virtio'
-            minSize: 100MB
-            maxSize: 100MB
+            minSize: 512MB
+            maxSize: 512MB
           encryption:
             provider: luks2
             keys:
@@ -1920,7 +1920,7 @@ jobs:
           DEADLINE=$(( SECONDS + 180 ))
           while [[ $SECONDS -lt $DEADLINE ]]; do
             DISK_READY=$(kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o json \
-              | jq -r '.status.diskStatus["talos-uservol"].conditions.Schedulable.status // empty')
+              | jq -r '(.status.diskStatus["talos-uservol"].conditions[]? | select(.type == "Schedulable") | .status) // empty' | head -n1)
             if [[ "${DISK_READY}" == "true" || "${DISK_READY}" == "True" ]]; then
               break
             fi
@@ -1929,7 +1929,7 @@ jobs:
           done
 
           DISK_READY=$(kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o json \
-            | jq -r '.status.diskStatus["talos-uservol"].conditions.Schedulable.status // empty')
+            | jq -r '(.status.diskStatus["talos-uservol"].conditions[]? | select(.type == "Schedulable") | .status) // empty' | head -n1)
           if [[ "${DISK_READY}" != "true" && "${DISK_READY}" != "True" ]]; then
             echo "[FAIL] Longhorn disk talos-uservol was not schedulable"
             kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o yaml
