@@ -254,7 +254,7 @@ talos:
   #   and ensure all volumes on that node share the same endpoint, or split
   #   into separate Helm releases per KMS server.
   machineConfig:
-    enabled: false
+    enabled: true
     # Path to the Talos state directory on the host node.
     # Change only if running a non-standard Talos layout.
     hostPath: /system/state

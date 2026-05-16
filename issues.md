@@ -227,3 +227,11 @@ Status (2026-05-16):
 - [OPEN] Add a two-drive Talos test matrix and run all tests on both:
   - no encryption
   - static encryption
+
+
+
+# 7. BUG - CRITICAL: fstrim is run on longhorn volumes
+
+We should not be running fstrim on longhorn volumes, this should be taken care of by longhorn on recurring job
+
+Have a look, but it looks like to me that luks-fstrim is running fstrim on longhorn volumes: configmap.yaml#L189

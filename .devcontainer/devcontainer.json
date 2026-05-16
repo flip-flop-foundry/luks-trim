@@ -39,7 +39,8 @@
         "tim-koehler.helm-intellisense",
         "GitHub.vscode-github-actions",
         "ms-azuretools.vscode-docker",
-        "mhutchie.git-graph"
+        "mhutchie.git-graph",
+        "streetsidesoftware.code-spell-checker"
       ],
       "settings": {
         "yaml.schemas": {
