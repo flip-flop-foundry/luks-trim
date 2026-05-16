@@ -1816,6 +1816,18 @@ jobs:
 
             if [[ "${run_luks_trim}" == "true" ]]; then
               run_luks_trim_and_assert_worker "${case_label}"
+              if [[ "${case_label}" == "plain" ]]; then
+                if echo "$LAST_WORKER_LOGS" | grep -q "running fstrim"; then
+                  echo "[FAIL] ${case_label}: worker attempted direct fstrim on Longhorn volume"
+                  echo "$LAST_WORKER_LOGS"
+                  return 1
+                fi
+                if ! echo "$LAST_WORKER_LOGS" | grep -q "not LUKS-encrypted"; then
+                  echo "[FAIL] ${case_label}: worker did not report non-LUKS Longhorn handling"
+                  echo "$LAST_WORKER_LOGS"
+                  return 1
+                fi
+              fi
             else
               echo "[INFO] ${case_label}: skipping luks-trim worker (no-encryption class)"
             fi
