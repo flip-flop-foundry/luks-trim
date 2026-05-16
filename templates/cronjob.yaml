@@ -200,7 +200,7 @@ spec:
                                 imagePullPolicy: $pullpol,
                                 securityContext: {privileged: true},
                                 resources: $res,
-                                env: [
+                                env: ([
                                   {name: "LONGHORN_ENABLED",           value: $le},
                                   {name: "TALOS_ENABLED",              value: $te},
                                   {name: "KMS_ENDPOINT",               value: $kms},
@@ -214,19 +214,19 @@ spec:
                                   {name: "TALOS_STATIC_KEY_NS",        value: $tskns},
                                   {name: "TALOS_STATIC_KEY_SECRET",    value: $tsksec},
                                   {name: "TALOS_STATIC_KEY_FIELD",     value: $tskfield}
-                                ] + (if $mcpath != "" then [{name: "TALOS_MC_PATH", value: $mcpath}] else [] end),
+                                ] + (if $mcpath != "" then [{name: "TALOS_MC_PATH", value: $mcpath}] else [] end)),
                                 command: ["/bin/sh", "/scripts/trim.sh"],
-                                volumeMounts: [
+                                volumeMounts: ([
                                   {name: "dev",         mountPath: "/dev"},
                                   {name: "host-ssl",    mountPath: "/etc/ssl/certs", readOnly: true},
                                   {name: "trim-script", mountPath: "/scripts",       readOnly: true}
-                                ] + (if $mcpath != "" then [{name: "host-talos-state", mountPath: $mcpath, readOnly: true}] else [] end)
+                                ] + (if $mcpath != "" then [{name: "host-talos-state", mountPath: $mcpath, readOnly: true}] else [] end))
                               }],
-                              volumes: [
+                              volumes: ([
                                 {name: "dev",         hostPath: {path: "/dev"}},
                                 {name: "host-ssl",    hostPath: {path: "/etc/ssl/certs", type: "Directory"}},
                                 {name: "trim-script", configMap: {name: $cm, defaultMode: 493}}
-                              ] + (if $mcpath != "" then [{name: "host-talos-state", hostPath: {path: {{ .Values.talos.machineConfig.hostPath | default "/system/state" | quote }}, type: "Directory"}}] else [] end)
+                              ] + (if $mcpath != "" then [{name: "host-talos-state", hostPath: {path: {{ .Values.talos.machineConfig.hostPath | default "/system/state" | quote }}, type: "Directory"}}] else [] end))
                             }
                           }
                         }
