@@ -538,8 +538,8 @@ jobs:
             exit 1
           fi
 
-          if ! echo "${MOUNT_YAML}" | grep -q "source: /dev/mapper/luks2-"; then
-            echo "[FAIL] Talos uservolume source is not a luks2 mapper device"
+          if ! echo "${MOUNT_YAML}" | grep -Eq "source: /dev/(mapper/luks2-|dm-)"; then
+            echo "[FAIL] Talos uservolume source is not a dm-crypt device"
             exit 1
           fi
 
