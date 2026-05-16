@@ -653,7 +653,12 @@ jobs:
       # 5. TEST FIXTURES
       # ======================================================================
 
+      - name: Ensure test namespace exists
+        run: |
+          kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
+
       - name: Create test namespace and Longhorn key secrets
+        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
 
@@ -693,6 +698,7 @@ jobs:
             --from-literal=CRYPTO_PBKDF=argon2i
 
       - name: Create Longhorn StorageClasses
+        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: storage.k8s.io/v1
@@ -781,6 +787,7 @@ jobs:
           EOF
 
       - name: Create test PVC and filler pod
+        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: v1
