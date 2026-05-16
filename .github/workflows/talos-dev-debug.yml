@@ -268,11 +268,6 @@ jobs:
             exit 1
           fi
 
-          # Keep raw sparse disk format: no convert step needed during restore.
-          cp --sparse=always "$DISK_PATH" "$SNAP_DIR/controlplane-1.disk"
-          cp --sparse=always "$FLASH0_PATH" "$SNAP_DIR/flash0.img"
-          cp --sparse=always "$FLASH1_PATH" "$SNAP_DIR/flash1.img"
-
           if [[ ! -f "$TALOSCONFIG" ]]; then
             echo "[FAIL] Expected talosconfig not found at ${TALOSCONFIG}"
             exit 1
@@ -294,6 +289,27 @@ jobs:
               in_endpoints && $1 == "-" {print $2; exit}
             ' | sed -E 's#^https?://##; s#:[0-9]+$##')
           fi
+
+          if [[ -n "$TALOS_NODE" ]]; then
+            talosctl --talosconfig "$SNAP_DIR/talosconfig" --nodes "$TALOS_NODE" shutdown --force --wait --timeout=10m
+
+            for _ in $(seq 1 90); do
+              if ! pgrep -f "${CLUSTER_NAME}-controlplane-1-0.disk" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            if pgrep -f "${CLUSTER_NAME}-controlplane-1-0.disk" >/dev/null 2>&1; then
+              echo "[FAIL] Control plane VM did not stop after shutdown request"
+              exit 1
+            fi
+          fi
+
+          # Keep raw sparse disk format: no convert step needed during restore.
+          cp --sparse=always "$DISK_PATH" "$SNAP_DIR/controlplane-1.disk"
+          cp --sparse=always "$FLASH0_PATH" "$SNAP_DIR/flash0.img"
+          cp --sparse=always "$FLASH1_PATH" "$SNAP_DIR/flash1.img"
 
           if [[ -n "$TALOS_NODE" ]]; then
             talosctl --talosconfig "$SNAP_DIR/talosconfig" kubeconfig --nodes "$TALOS_NODE" --merge=false "$SNAP_DIR/kubeconfig" || true
