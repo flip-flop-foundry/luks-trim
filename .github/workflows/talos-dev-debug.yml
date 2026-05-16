@@ -1,0 +1,261 @@
+name: Talos Dev Provisioner Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      talos-version:
+        description: >
+          Talos version without the leading "v" (for example 1.13.2).
+          Leave blank to use the latest stable release.
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: talos-dev-debug
+  cancel-in-progress: false
+
+env:
+  CLUSTER_NAME: luks-trim-dev-debug
+  TALOSCONFIG: ${{ github.workspace }}/talosconfig
+
+jobs:
+  talos-dev-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-system-x86 qemu-kvm cpu-checker
+          sudo chmod 666 /dev/kvm
+          kvm-ok
+
+      - name: Resolve Talos version
+        id: talos
+        run: |
+          VER="${{ inputs.talos-version }}"
+          if [[ -z "$VER" ]]; then
+            VER=$(curl -sSfL https://api.github.com/repos/siderolabs/talos/releases/latest \
+              | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Talos version: v${VER}"
+
+      - name: Install talosctl
+        run: |
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${{ steps.talos.outputs.version }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Create Talos dev cluster
+        env:
+          TALOS_VERSION: ${{ steps.talos.outputs.version }}
+        run: |
+          cat > /tmp/mc-patch.yaml <<EOF
+          cluster:
+            allowSchedulingOnControlPlanes: true
+          machine:
+            install:
+              image: factory.talos.dev/installer/613e1592b2da41ae5e265e8789429f22e121aab91cb4deb6bc3c0b6262961245:v${TALOS_VERSION}
+          EOF
+
+          AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
+          RESERVED_MIB=12288
+          MIN_DISK_MIB=10240
+          MAX_DISK_MIB=12288
+          TALOS_DISK_MIB=$(( AVAILABLE_MIB - RESERVED_MIB ))
+
+          if (( TALOS_DISK_MIB > MAX_DISK_MIB )); then
+            TALOS_DISK_MIB=$MAX_DISK_MIB
+          fi
+
+          if (( TALOS_DISK_MIB < MIN_DISK_MIB )); then
+            echo "[FAIL] Not enough free disk for Talos VM"
+            echo "[diagnostic] available=${AVAILABLE_MIB}MiB reserved=${RESERVED_MIB}MiB required_min=${MIN_DISK_MIB}MiB"
+            df -h "$HOME" || true
+            exit 1
+          fi
+
+          echo "[info] host free space under $HOME: ${AVAILABLE_MIB}MiB"
+          echo "[info] selected Talos disk size: ${TALOS_DISK_MIB}MiB"
+
+          MONITOR_START=$(date +%s)
+          ROUTE_DIAG_DUMPED=0
+
+          dump_network_diagnostics() {
+            local target_node="${1:-}"
+
+            echo "[diagnostic] network interfaces (brief):"
+            ip -br addr || true
+            echo "[diagnostic] network links (brief):"
+            ip -br link || true
+            echo "[diagnostic] route table:"
+            ip route show || true
+            echo "[diagnostic] bridge links:"
+            bridge link show || true
+
+            if [[ -n "${target_node}" ]]; then
+              echo "[diagnostic] route lookup for ${target_node}:"
+              ip route get "${target_node}" || true
+            fi
+
+            local cp_pid_file="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1.pid"
+            if [[ -f "${cp_pid_file}" ]]; then
+              local cp_pid
+              cp_pid=$(cat "${cp_pid_file}" 2>/dev/null || true)
+              echo "[diagnostic] controlplane pid file: ${cp_pid_file} -> ${cp_pid:-unknown}"
+              if [[ -n "${cp_pid}" ]]; then
+                ps -p "${cp_pid}" -o pid,ppid,stat,etime,command || true
+              fi
+            fi
+          }
+
+          monitor_talos_create() {
+            while true; do
+              NOW=$(date +%s)
+              ELAPSED=$(( NOW - MONITOR_START ))
+              echo "[monitor] $(date -u +%Y-%m-%dT%H:%M:%SZ) talos-create elapsed=${ELAPSED}s"
+
+              QEMU_COUNT=$(pgrep -fc 'qemu-system|qemu-kvm' || true)
+              echo "[monitor] qemu process count (system|kvm): ${QEMU_COUNT}"
+
+              FREE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
+              echo "[monitor] host free space under $HOME: ${FREE_MIB:-unknown}MiB"
+
+              if [[ -f "$TALOSCONFIG" ]]; then
+                echo "[monitor] talosconfig detected: ${TALOSCONFIG}"
+
+                if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "$TALOSCONFIG" config info -o yaml >/tmp/talos-config-info.log 2>&1; then
+                  TALOS_NODE=$(awk '
+                    /^nodes:/ {in_nodes=1; in_endpoints=0; next}
+                    /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
+                    /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
+                    in_nodes && $1 == "-" {print $2; exit}
+                  ' /tmp/talos-config-info.log)
+
+                  if [[ -z "${TALOS_NODE}" ]]; then
+                    TALOS_NODE=$(awk '
+                      /^endpoints:/ {in_endpoints=1; next}
+                      /^[^[:space:]-]/ {in_endpoints=0}
+                      in_endpoints && $1 == "-" {print $2; exit}
+                    ' /tmp/talos-config-info.log | sed -E 's#^https?://##; s#:[0-9]+$##')
+                  fi
+
+                  if [[ -n "${TALOS_NODE}" ]]; then
+                    echo "[monitor] talos node target: ${TALOS_NODE}"
+
+                    if timeout --signal=TERM 10s sudo -E talosctl --talosconfig "$TALOSCONFIG" --nodes "${TALOS_NODE}" get members >/tmp/talos-members-probe.log 2>&1; then
+                      echo "[monitor] talosctl get members: ok"
+                      sed -n '1,20p' /tmp/talos-members-probe.log || true
+                    else
+                      echo "[monitor] talosctl get members rc=$?"
+                      sed -n '1,8p' /tmp/talos-members-probe.log || true
+
+                      if [[ "${ROUTE_DIAG_DUMPED}" -eq 0 ]] && grep -q "no route to host" /tmp/talos-members-probe.log; then
+                        echo "[monitor] first no-route-to-host observed during get members"
+                        dump_network_diagnostics "${TALOS_NODE}"
+                        ROUTE_DIAG_DUMPED=1
+                      fi
+                    fi
+                  fi
+                fi
+              else
+                echo "[monitor] talosconfig not created yet"
+              fi
+
+              sleep 20
+            done
+          }
+
+          cleanup_monitor() {
+            if [[ -n "${MONITOR_PID:-}" ]]; then
+              kill "${MONITOR_PID}" >/dev/null 2>&1 || true
+              wait "${MONITOR_PID}" >/dev/null 2>&1 || true
+            fi
+          }
+
+          monitor_talos_create &
+          MONITOR_PID=$!
+          trap cleanup_monitor EXIT
+
+          set +e
+          timeout --signal=TERM 45m sudo --preserve-env=HOME talosctl cluster create dev \
+            --name "$CLUSTER_NAME" \
+            --arch amd64 \
+            --controlplanes 1 \
+            --workers 0 \
+            --disk "${TALOS_DISK_MIB}" \
+            --disk-preallocate=false \
+            --memory "4096MiB" \
+            --cpus "2.0" \
+            --talos-version "v${TALOS_VERSION}" \
+            --config-patch-control-plane @/tmp/mc-patch.yaml \
+            --talosconfig "$TALOSCONFIG" \
+            --wait-timeout 30m
+          CREATE_RC=$?
+          set -e
+
+          cleanup_monitor
+          trap - EXIT
+
+          if [[ "${CREATE_RC}" -ne 0 ]]; then
+            echo "[FAIL] talosctl cluster create dev failed with exit code ${CREATE_RC}"
+            echo "[diagnostic] qemu processes:"
+            ps -ef | grep -E "qemu-system|qemu-kvm|dnsmasq|tap|bridge" | grep -v grep || true
+            echo "[diagnostic] runner talos state tree (if present):"
+            ls -R "${HOME}/.talos" || true
+            echo "[diagnostic] /root/.talos tree (if present):"
+            sudo ls -R /root/.talos || true
+            echo "[diagnostic] controlplane log tail (if present):"
+            tail -n 300 "${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1.log" || true
+            echo "[diagnostic] dhcpd/lb log tails (if present):"
+            tail -n 120 "${HOME}/.talos/clusters/${CLUSTER_NAME}/dhcpd.log" || true
+            tail -n 120 "${HOME}/.talos/clusters/${CLUSTER_NAME}/lb.log" || true
+            exit "${CREATE_RC}"
+          fi
+
+          sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
+          talosctl --talosconfig "$TALOSCONFIG" version
+
+      - name: Stage Talos diagnostics artifact
+        if: always()
+        run: |
+          ARTIFACT_DIR=/tmp/talos-dev-debug-artifact
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+
+          if [[ -f "$TALOSCONFIG" ]]; then
+            cp "$TALOSCONFIG" "$ARTIFACT_DIR/talosconfig"
+          fi
+
+          if [[ -d "$HOME/.talos" ]]; then
+            cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos"
+          fi
+
+          if sudo test -d /root/.talos; then
+            sudo cp -a /root/.talos "$ARTIFACT_DIR/root-talos"
+          fi
+
+          sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
+
+      - name: Upload Talos diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: talos-dev-debug-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: /tmp/talos-dev-debug-artifact
+
+      - name: Destroy Talos cluster
+        if: always()
+        run: |
+          sudo --preserve-env=HOME talosctl cluster destroy --name "$CLUSTER_NAME" || true
