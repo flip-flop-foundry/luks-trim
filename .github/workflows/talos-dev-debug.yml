@@ -245,6 +245,31 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
           talosctl version --client
 
+          TALOS_NODE=$(talosctl --talosconfig "$TALOSCONFIG" config info -o yaml | awk '
+            /^nodes:/ {in_nodes=1; in_endpoints=0; next}
+            /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
+            /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
+            in_nodes && $1 == "-" {print $2; exit}
+          ')
+
+          if [[ -z "$TALOS_NODE" ]]; then
+            TALOS_NODE=$(talosctl --talosconfig "$TALOSCONFIG" config info -o yaml | awk '
+              /^endpoints:/ {in_endpoints=1; next}
+              /^[^[:space:]-]/ {in_endpoints=0}
+              in_endpoints && $1 == "-" {print $2; exit}
+            ' | sed -E 's#^https?://##; s#:[0-9]+$##')
+          fi
+
+          if [[ -z "$TALOS_NODE" ]]; then
+            echo "[FAIL] Could not determine Talos node from generated talosconfig"
+            exit 1
+          fi
+
+          talosctl --talosconfig "$TALOSCONFIG" health \
+            --init-node "$TALOS_NODE" \
+            --control-plane-nodes "$TALOS_NODE" \
+            --wait-timeout=10m
+
       - name: Stage restore snapshot artifact
         if: success()
         env:
@@ -288,23 +313,6 @@ jobs:
               /^[^[:space:]-]/ {in_endpoints=0}
               in_endpoints && $1 == "-" {print $2; exit}
             ' | sed -E 's#^https?://##; s#:[0-9]+$##')
-          fi
-
-          if [[ -n "$TALOS_NODE" ]]; then
-            talosctl --talosconfig "$SNAP_DIR/talosconfig" --nodes "$TALOS_NODE" shutdown --force --wait --timeout=10m
-
-            for _ in $(seq 1 90); do
-              if ! pgrep -f "${CLUSTER_NAME}-controlplane-1-0.disk" >/dev/null 2>&1; then
-                break
-              fi
-              sleep 2
-            done
-
-            if pgrep -f "${CLUSTER_NAME}-controlplane-1-0.disk" >/dev/null 2>&1; then
-              echo "[warn] Control plane VM still running after shutdown request, forcing stop"
-              sudo pkill -f "${CLUSTER_NAME}-controlplane-1-0.disk" || true
-              sleep 5
-            fi
           fi
 
           # Keep raw sparse disk format: no convert step needed during restore.
