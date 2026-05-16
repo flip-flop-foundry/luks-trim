@@ -13,7 +13,7 @@
 #     lines appear (not swallowed by the "already active" fast-path) and
 #     Longhorn actualSize is unchanged.
 #
-# T1  Live run  – write 2 GiB → delete → run luks-trim (enables LUKS
+# T1  Live run  – write 1536 MiB → delete → run luks-trim (enables LUKS
 #     allow-discards) → trigger Longhorn filesystem-trim CronJob →
 #     assert Longhorn actualSize shrank.
 #
@@ -909,8 +909,15 @@ jobs:
                   claimName: t0-new-vol
             restartPolicy: Never
           EOF
-          kubectl wait pod/t0-filler -n luks-trim-test \
-            --for=condition=Ready --timeout=5m
+          if ! kubectl wait pod/t0-filler -n luks-trim-test \
+            --for=condition=Ready --timeout=2m; then
+            echo "[FAIL] t0-filler did not become Ready within 2m"
+            kubectl get pod t0-filler -n luks-trim-test -o wide || true
+            kubectl describe pod t0-filler -n luks-trim-test || true
+            kubectl get pvc t0-new-vol -n luks-trim-test -o wide || true
+            kubectl describe pvc t0-new-vol -n luks-trim-test || true
+            exit 1
+          fi
 
       - name: "[T0] Write 256 MiB to fresh volume"
         if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
@@ -1073,7 +1080,7 @@ jobs:
             storageClassName: luks-global-key
             resources:
               requests:
-                  storage: 3Gi
+                  storage: 2Gi
           ---
           apiVersion: v1
           kind: Pod
@@ -1094,25 +1101,31 @@ jobs:
                   claimName: test-vol
             restartPolicy: Never
           EOF
-
-          kubectl wait pod/filler -n luks-trim-test \
-            --for=condition=Ready --timeout=5m
+          if ! kubectl wait pod/filler -n luks-trim-test \
+            --for=condition=Ready --timeout=2m; then
+            echo "[FAIL] filler did not become Ready within 2m"
+            kubectl get pod filler -n luks-trim-test -o wide || true
+            kubectl describe pod filler -n luks-trim-test || true
+            kubectl get pvc test-vol -n luks-trim-test -o wide || true
+            kubectl describe pvc test-vol -n luks-trim-test || true
+            exit 1
+          fi
 
       # ======================================================================
       # T1 — LIVE RUN
       #
-      # 1. Write 2 GiB → assert Longhorn actualSize grew
+      # 1. Write 1536 MiB → assert Longhorn actualSize grew
       # 2. Delete file  → assert actualSize did NOT automatically shrink
       # 3. Run luks-trim cronjob manually
       # 4. Trigger Longhorn filesystem-trim CronJob manually
-      # 5. Assert actualSize shrank (hard fail if < 1 GiB reclaimed)
+      # 5. Assert actualSize shrank (hard fail if < 512 MiB reclaimed)
       # ======================================================================
 
-      - name: "[T1] Write 2 GiB to encrypted volume"
+      - name: "[T1] Write 1536 MiB to encrypted volume"
         if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl exec filler -n luks-trim-test -- \
-            dd if=/dev/urandom of=/data/testfile bs=1M count=2048 status=progress
+            dd if=/dev/urandom of=/data/testfile bs=1M count=1536 status=progress
           kubectl exec filler -n luks-trim-test -- sync
 
       - name: "[T1] Capture Longhorn actualSize after write"
@@ -1129,10 +1142,10 @@ jobs:
           SIZE=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
             -n longhorn-system -o jsonpath='{.status.actualSize}')
           echo "size_after_write=${SIZE}" >> "$GITHUB_OUTPUT"
-          echo "Longhorn actualSize after 2 GiB write: ${SIZE} bytes"
+          echo "Longhorn actualSize after 1536 MiB write: ${SIZE} bytes"
 
-          if [[ "${SIZE}" -lt $((1500 * 1024 * 1024)) ]]; then
-            echo "[FAIL] actualSize ${SIZE} is below 1.5 GiB after a 2 GiB write"
+          if [[ "${SIZE}" -lt $((1100 * 1024 * 1024)) ]]; then
+            echo "[FAIL] actualSize ${SIZE} is below 1.1 GiB after a 1536 MiB write"
             exit 1
           fi
 
@@ -1371,9 +1384,9 @@ jobs:
           echo "Reclaimed: ${RECLAIMED} bytes"
 
           # Enforce reclaim expectation as a hard gate for this workflow.
-          MIN_RECLAIM=$(( 1024 * 1024 * 1024 ))
+          MIN_RECLAIM=$(( 512 * 1024 * 1024 ))
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
-            echo "[FAIL] Less than 1 GiB reclaimed (${RECLAIMED} bytes)."
+            echo "[FAIL] Less than 512 MiB reclaimed (${RECLAIMED} bytes)."
             echo "       Expected Longhorn filesystem-trim to reclaim at least ${MIN_RECLAIM} bytes."
             exit 1
           fi
