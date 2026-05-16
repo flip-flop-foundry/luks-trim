@@ -64,9 +64,6 @@ concurrency:
 
 env:
   CLUSTER_NAME: luks-trim-test
-  # Temporary CI speed-up switch while iterating on the Talos uservolume path.
-  # Set to "true" to run T0-T3 again.
-  RUN_LEGACY_TESTS: "true"
   TALOS_USERVOLUME_NAME: longhorn-uvol
   TALOS_USERVOLUME_STATIC_PASSPHRASE: ci-talos-uservolume-static-passphrase
   TALOS_USERVOLUME_LONGHORN_PATH: /var/mnt/longhorn-uvol/longhorn
@@ -677,7 +674,6 @@ jobs:
           kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Create test namespace and Longhorn key secrets
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl create namespace luks-trim-test --dry-run=client -o yaml | kubectl apply -f -
 
@@ -717,7 +713,6 @@ jobs:
             --from-literal=CRYPTO_PBKDF=argon2i
 
       - name: Create Longhorn StorageClasses
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: storage.k8s.io/v1
@@ -870,7 +865,7 @@ jobs:
       # hits the "already active" fast-path instead.  T0 closes that gap.
       #
       # 1. Create a fresh encrypted PVC + pod.
-      # 2. Write 256 MiB to give the worker something to report on.
+      # 2. Write 512 MiB to give the worker something to report on.
       # 3. Upgrade chart with dryRun=true.
       # 4. Run luks-trim → assert [dry-run] lines present, no [ERROR] lines.
       # 5. Assert Longhorn actualSize unchanged (fstrim must NOT have run).
@@ -878,7 +873,6 @@ jobs:
       # ======================================================================
 
       - name: "[T0] Create fresh encrypted PVC and pod"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: v1
@@ -891,7 +885,7 @@ jobs:
             storageClassName: luks-global-key
             resources:
               requests:
-                storage: 512Mi
+                storage: 1Gi
           ---
           apiVersion: v1
           kind: Pod
@@ -922,15 +916,13 @@ jobs:
             exit 1
           fi
 
-      - name: "[T0] Write 256 MiB to fresh volume"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
+      - name: "[T0] Write 512 MiB to fresh volume"
         run: |
           kubectl exec t0-filler -n luks-trim-test -- \
-            dd if=/dev/urandom of=/data/t0-file.bin bs=1M count=256 status=none
+            dd if=/dev/urandom of=/data/t0-file.bin bs=1M count=512 status=none
           kubectl exec t0-filler -n luks-trim-test -- sync
 
       - name: "[T0] Capture actualSize before dry-run"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: t0-before
         run: |
           sleep 15
@@ -943,7 +935,6 @@ jobs:
           echo "T0 actualSize before dry-run: ${SIZE} bytes"
 
       - name: "[T0] Upgrade chart: dryRun=true"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           helm upgrade luks-trim . \
             --namespace   luks-trim \
@@ -951,7 +942,6 @@ jobs:
             --set dryRun=true
 
       - name: "[T0] Run luks-trim dry-run on new volume"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: t0-dryrun-job
         run: |
           TS=$(date +%s)
@@ -1005,7 +995,6 @@ jobs:
           echo "===== [T0 worker logs] END ====="
 
       - name: "[T0] Assert [dry-run] lines on new volume and no [ERROR] lines"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           WORKER_JOB="${{ steps.t0-dryrun-job.outputs.worker_job }}"
           LOGS=$(kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
@@ -1033,7 +1022,6 @@ jobs:
           echo "[PASS] T0: [dry-run] lines present and no errors on fresh volume"
 
       - name: "[T0] Assert actualSize unchanged after dry-run"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           VOL_NAME="${{ steps.t0-before.outputs.vol_name }}"
           SIZE_AFTER=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
@@ -1057,7 +1045,6 @@ jobs:
           echo "[PASS] T0: actualSize stable during dry-run (delta: ${DELTA} bytes)"
 
       - name: "[T0] Restore chart: dryRun=false and clean up T0 resources"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           helm upgrade luks-trim . \
             --namespace   luks-trim \
@@ -1070,7 +1057,6 @@ jobs:
           kubectl wait --for=delete pvc/t0-new-vol -n luks-trim-test --timeout=3m || true
 
       - name: Create test PVC and filler pod
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl apply -f - <<'EOF'
           apiVersion: v1
@@ -1150,14 +1136,12 @@ jobs:
       # ======================================================================
 
       - name: "[T1] Write 768 MiB to encrypted volume"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl exec filler -n luks-trim-test -- \
             dd if=/dev/urandom of=/data/testfile bs=1M count=768 status=progress
           kubectl exec filler -n luks-trim-test -- sync
 
       - name: "[T1] Capture Longhorn actualSize after write"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: baseline
         run: |
           # Allow Longhorn replica accounting to settle.
@@ -1178,7 +1162,6 @@ jobs:
           fi
 
       - name: "[T1] Delete file – assert no automatic storage reclaim"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: pre-trim
         run: |
           kubectl exec filler -n luks-trim-test -- rm /data/testfile
@@ -1199,7 +1182,6 @@ jobs:
           fi
 
       - name: "[T1] Run luks-trim (live)"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: live-run
         run: |
           TS=$(date +%s)
@@ -1326,7 +1308,6 @@ jobs:
           print_namespace_events "worker-final"
 
       - name: "[T1] Assert worker pods exited 0 and contain no [ERROR] lines"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           WORKER_JOB="${{ steps.live-run.outputs.worker_job }}"
 
@@ -1365,7 +1346,6 @@ jobs:
           echo "[PASS] Worker pod exited 0; no error lines found"
 
       - name: "[T1] Trigger Longhorn filesystem-trim CronJob"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           CRONJOB_NAME="ci-filesystem-trim"
           TRIGGER_JOB="${CRONJOB_NAME}-manual-$(date +%s)"
@@ -1395,7 +1375,6 @@ jobs:
           kubectl -n longhorn-system get events --sort-by=.lastTimestamp | tail -n 60 || true
 
       - name: "[T1] Assert Longhorn actualSize shrank after luks-trim"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           # Allow Longhorn replica accounting to settle after worker completion.
           sleep 30
@@ -1432,7 +1411,6 @@ jobs:
       # ======================================================================
 
       - name: "[T2] Upgrade chart: dryRun=true"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           helm upgrade luks-trim . \
             --namespace   luks-trim \
@@ -1440,14 +1418,12 @@ jobs:
             --set dryRun=true
 
       - name: "[T2] Write 512 MiB of fresh data"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           kubectl exec filler -n luks-trim-test -- \
             dd if=/dev/urandom of=/data/dryrun-file bs=1M count=512 status=progress
           kubectl exec filler -n luks-trim-test -- sync
 
       - name: "[T2] Capture actualSize before dry run"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: dryrun-before
         run: |
           sleep 10
@@ -1458,7 +1434,6 @@ jobs:
           echo "actualSize before dry run: ${SIZE} bytes"
 
       - name: "[T2] Run luks-trim (dry-run)"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         id: dry-run-job
         run: |
           TS=$(date +%s)
@@ -1587,7 +1562,6 @@ jobs:
           print_namespace_events "dryrun-worker-final"
 
       - name: "[T2] Assert [dry-run] lines present and no [ERROR] lines"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           WORKER_JOB="${{ steps.dry-run-job.outputs.worker_job }}"
 
@@ -1640,7 +1614,6 @@ jobs:
           echo "[PASS] Dry-run assertions passed"
 
       - name: "[T2] Assert actualSize unchanged during dry run"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
           SIZE_AFTER=$(kubectl get volume.longhorn.io "${VOL_NAME}" \
@@ -1680,7 +1653,6 @@ jobs:
       # ======================================================================
 
       - name: "[T3] Upgrade chart: dryRun=false"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           helm upgrade luks-trim . \
             --namespace   luks-trim \
@@ -1688,7 +1660,6 @@ jobs:
             --set dryRun=false
 
       - name: "[T3] Run T1-style reclaim flow for ns/pvc/plain classes"
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
         run: |
           LAST_WORKER_LOGS=""
           LAST_WORKER_JOB=""
@@ -1797,7 +1768,7 @@ jobs:
             storageClassName: ${storage_class}
             resources:
               requests:
-                storage: 512Mi
+                storage: 1Gi
           ---
           apiVersion: v1
           kind: Pod
@@ -1886,9 +1857,9 @@ jobs:
             echo "[PASS] ${case_label}: T1-style reclaim flow passed"
           }
 
-          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 256 128 true
-          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 256 128 true
-          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 256 128 true
+          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 512 400 true
+          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 512 400 true
+          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 512 400 true
 
       # ======================================================================
       # T4 — TALOS ENCRYPTED USERVOLUME AS LONGHORN DISK PATH
@@ -1942,8 +1913,8 @@ jobs:
                   type: Directory
           EOF
 
-          if ! kubectl wait -n longhorn-system --for=condition=Ready pod/t4-uservol-probe --timeout=5m; then
-            echo "[FAIL] t4-uservol-probe pod was not Ready"
+          if ! kubectl wait -n longhorn-system --for=jsonpath='{.status.phase}'=Succeeded pod/t4-uservol-probe --timeout=5m; then
+            echo "[FAIL] t4-uservol-probe pod did not complete successfully"
             kubectl -n longhorn-system describe pod t4-uservol-probe || true
             exit 1
           fi
@@ -2130,7 +2101,7 @@ jobs:
             storageClassName: talos-uservol-no-encryption
             resources:
               requests:
-                storage: 64Mi
+                storage: 1Gi
           ---
           apiVersion: v1
           kind: Pod
@@ -2177,12 +2148,12 @@ jobs:
           fi
 
           kubectl exec t4-talos-uservol-filler -n luks-trim-test -- \
-            dd if=/dev/urandom of=/data/t4-file.bin bs=1M count=32 status=none
+            dd if=/dev/urandom of=/data/t4-file.bin bs=1M count=512 status=none
           kubectl exec t4-talos-uservol-filler -n luks-trim-test -- sync
           sleep 10
 
           SIZE_AFTER_WRITE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
-          WRITE_FLOOR=$(( 32 * 1024 * 1024 * 70 / 100 ))
+          WRITE_FLOOR=$(( 512 * 1024 * 1024 * 70 / 100 ))
           if [[ "${SIZE_AFTER_WRITE}" -lt "${WRITE_FLOOR}" ]]; then
             echo "[FAIL] actualSize ${SIZE_AFTER_WRITE} is below floor ${WRITE_FLOOR} after write"
             exit 1
@@ -2200,7 +2171,7 @@ jobs:
           sleep 20
           POST_TRIM=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
           RECLAIMED=$(( PRE_TRIM - POST_TRIM ))
-          MIN_RECLAIM=$(( 8 * 1024 * 1024 ))
+          MIN_RECLAIM=$(( 400 * 1024 * 1024 ))
 
           echo "[info] T4 pre-trim=${PRE_TRIM} post-trim=${POST_TRIM} reclaimed=${RECLAIMED}"
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
