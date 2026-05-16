@@ -802,45 +802,6 @@ jobs:
             encrypted: "false"
           EOF
 
-      - name: Create test PVC and filler pod
-        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
-        run: |
-          kubectl apply -f - <<'EOF'
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: test-vol
-            namespace: luks-trim-test
-          spec:
-            accessModes: [ReadWriteOnce]
-            storageClassName: luks-global-key
-            resources:
-              requests:
-                  storage: 3Gi
-          ---
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: filler
-            namespace: luks-trim-test
-          spec:
-            containers:
-              - name: filler
-                image: ubuntu:24.04
-                command: ["sleep", "3600"]
-                volumeMounts:
-                  - name: data
-                    mountPath: /data
-            volumes:
-              - name: data
-                persistentVolumeClaim:
-                  claimName: test-vol
-            restartPolicy: Never
-          EOF
-
-          kubectl wait pod/filler -n luks-trim-test \
-            --for=condition=Ready --timeout=5m
-
       # ======================================================================
       # 6. INSTALL luks-trim CHART
       #
@@ -1097,6 +1058,45 @@ jobs:
           kubectl delete pvc t0-new-vol -n luks-trim-test --ignore-not-found=true
           kubectl wait --for=delete pod/t0-filler -n luks-trim-test --timeout=3m || true
           kubectl wait --for=delete pvc/t0-new-vol -n luks-trim-test --timeout=3m || true
+
+      - name: Create test PVC and filler pod
+        if: ${{ env.RUN_LEGACY_TESTS == 'true' }}
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-vol
+            namespace: luks-trim-test
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-global-key
+            resources:
+              requests:
+                  storage: 3Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: filler
+            namespace: luks-trim-test
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: test-vol
+            restartPolicy: Never
+          EOF
+
+          kubectl wait pod/filler -n luks-trim-test \
+            --for=condition=Ready --timeout=5m
 
       # ======================================================================
       # T1 — LIVE RUN
