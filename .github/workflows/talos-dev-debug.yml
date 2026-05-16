@@ -1,6 +1,9 @@
 name: Talos Dev Provisioner Debug
 
 on:
+  push:
+    branches:
+      - research/qemu-image-cache
   workflow_dispatch:
     inputs:
       talos-version:
