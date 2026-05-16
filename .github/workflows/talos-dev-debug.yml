@@ -58,6 +58,19 @@ jobs:
           chmod +x /usr/local/bin/talosctl
           talosctl version --client
 
+      - name: Download Talos kernel and initramfs for dev provisioner
+        env:
+          TALOS_VERSION: ${{ steps.talos.outputs.version }}
+        run: |
+          mkdir -p _out
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/vmlinuz-amd64" \
+            -o _out/vmlinuz-amd64
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/initramfs-amd64.xz" \
+            -o _out/initramfs-amd64.xz
+          ls -lh _out
+
       - name: Create Talos dev cluster
         env:
           TALOS_VERSION: ${{ steps.talos.outputs.version }}
@@ -246,6 +259,9 @@ jobs:
           if sudo test -d /root/.talos; then
             sudo cp -a /root/.talos "$ARTIFACT_DIR/root-talos" || true
           fi
+
+          # Exclude large raw VM disk files to keep artifact inspection practical.
+          find "$ARTIFACT_DIR" -type f -name '*.disk' -delete || true
 
           sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
 
