@@ -1,18 +1,19 @@
 {{- if .Values.createNamespace }}
 {{- /*
-  Only render this resource if the namespace does not already exist.
-  When Helm encounters a pre-existing namespace it issues a CREATE and
-  fails with "already exists".  By skipping the template when the namespace
-  is present we avoid that conflict while still creating it (with all the
-  desired labels) on a truly fresh install.
+  Always render this resource so that Helm owns the namespace and its labels.
+  On a fresh cluster Helm creates it; on a pre-existing namespace Helm patches
+  it (server-side apply), so labels are always reconciled.
 
-  For existing namespaces the caller is responsible for ensuring the
-  correct labels are present — the integration-test workflow does this
-  with "kubectl apply" before running helm, so labels are always set.
-  ArgoCD / FluxCD use server-side apply and handle create-vs-patch
-  automatically, so the template renders correctly there too.
+  Use `helm upgrade --install --server-side --create-namespace …` to avoid
+  "already exists" errors when the namespace pre-dates the Helm release.
+  `--create-namespace` ensures the namespace exists before Helm stores its
+  release secret; `--server-side` makes every resource (including this
+  Namespace) use a PATCH rather than a CREATE, so pre-existing namespaces
+  are updated instead of rejected.
+
+  To manage the namespace entirely outside the chart set:
+    createNamespace: false
 */}}
-{{- if not (lookup "v1" "Namespace" "" (include "luks-trim.namespace" .)) }}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -22,5 +23,4 @@ metadata:
     {{- with .Values.namespaceLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-{{- end }}
 {{- end }}
