@@ -535,7 +535,24 @@ jobs:
           sudo cp /tmp/kubeconfig "$KUBECONFIG"
           sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
 
-          kubectl --kubeconfig "$KUBECONFIG" wait node --all --for=condition=Ready --timeout=5m
+          CURRENT_CONTEXT=$(kubectl --kubeconfig "$KUBECONFIG" config current-context)
+          CURRENT_CLUSTER=$(kubectl --kubeconfig "$KUBECONFIG" config view -o jsonpath="{.contexts[?(@.name=='${CURRENT_CONTEXT}')].context.cluster}")
+          kubectl --kubeconfig "$KUBECONFIG" config set-cluster "$CURRENT_CLUSTER" --server=https://10.5.0.2:6443
+
+          for _ in $(seq 1 30); do
+            if kubectl --kubeconfig "$KUBECONFIG" wait node --all --for=condition=Ready --timeout=20s >/tmp/restore-kubectl-wait.log 2>&1; then
+              break
+            fi
+            sleep 10
+          done
+
+          if ! kubectl --kubeconfig "$KUBECONFIG" wait node --all --for=condition=Ready --timeout=20s >/tmp/restore-kubectl-wait.log 2>&1; then
+            echo "[FAIL] Restored Kubernetes API was not reachable/ready"
+            sed -n '1,60p' /tmp/restore-kubectl-wait.log || true
+            tail -n 200 /tmp/restore-qemu.log || true
+            exit 1
+          fi
+
           kubectl --kubeconfig "$KUBECONFIG" get nodes -o wide
 
       - name: Cleanup restored VM and network
