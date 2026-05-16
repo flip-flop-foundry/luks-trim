@@ -266,6 +266,7 @@ jobs:
           fi
 
           talosctl --talosconfig "$TALOSCONFIG" health \
+            --nodes "$TALOS_NODE" \
             --init-node "$TALOS_NODE" \
             --control-plane-nodes "$TALOS_NODE" \
             --wait-timeout=10m
