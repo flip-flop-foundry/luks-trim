@@ -2249,9 +2249,24 @@ jobs:
             kubectl describe -n luks-trim "${POD}" | sed -n '/^Containers:/,/^Conditions:/p' || true
           done
 
-          echo "=== Longhorn manager logs (last 50 lines) ==="
-          kubectl logs -n longhorn-system \
-            -l "app=longhorn-manager" --tail=50 || true
+          echo "=== Longhorn-system pods (detailed) ==="
+          kubectl get pods -n longhorn-system -o wide || true
+
+          echo "=== Longhorn-system events ==="
+          kubectl get events -n longhorn-system --sort-by=.lastTimestamp || true
+
+          echo "=== Longhorn-system pod descriptions ==="
+          for POD in $(kubectl get pods -n longhorn-system -o name 2>/dev/null); do
+            echo "=== describe ${POD} ==="
+            kubectl describe -n longhorn-system "${POD}" || true
+          done
+
+          echo "=== Longhorn-system logs (all pods, all containers, full) ==="
+          for POD in $(kubectl get pods -n longhorn-system -o name 2>/dev/null); do
+            echo "=== logs ${POD} (all containers) BEGIN ==="
+            kubectl logs -n longhorn-system "${POD}" --all-containers=true --tail=-1 || true
+            echo "=== logs ${POD} (all containers) END ==="
+          done
 
           echo "=== filler pod events ==="
           kubectl describe pod filler -n luks-trim-test || true
