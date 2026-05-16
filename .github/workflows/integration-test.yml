@@ -1968,7 +1968,9 @@ jobs:
             --set talos.staticKey.enabled=true \
             --set talos.staticKey.secretNamespace=luks-trim \
             --set talos.staticKey.secretName=talos-static-key \
-            --set talos.staticKey.secretKey=passphrase
+            --set talos.staticKey.secretKey=passphrase \
+            --set workerResources.requests.memory=128Mi \
+            --set workerResources.limits.memory=2Gi
 
       - name: "[T4] Run T1-style reclaim flow on Talos uservolume-backed Longhorn volume"
         run: |
