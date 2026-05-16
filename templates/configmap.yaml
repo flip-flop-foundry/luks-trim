@@ -272,10 +272,51 @@ data:
     # When talos.staticKey.enabled is true, the static passphrase is tried
     # as a fallback after sideroKMS (or as the primary when kmsEndpoint is
     # empty). This mirrors Talos itself, which supports multiple key slots.
+    #
+    # When talos.machineConfig.enabled is true, the Talos machine config is
+    # read from TALOS_MC_PATH (hostPath mount of /system/state/config.yaml)
+    # to auto-detect the KMS endpoint and/or static passphrase.
     process_talos_volumes() {
       echo "--- Checking Talos LUKS volumes..."
 
-      _kms_host=$(printf '%s' "$KMS_ENDPOINT" | sed 's|^https://||')
+      {{- if .Values.talos.machineConfig.enabled }}
+      # ── Machine config auto-detection ───────────────────────────────────
+      # The Talos machine config is mounted read-only at $TALOS_MC_PATH.
+      # Extract KMS endpoint and static passphrase from it, using yq for
+      # reliable YAML parsing.
+      _mc_file="${TALOS_MC_PATH}/config.yaml"
+      if [ ! -f "$_mc_file" ]; then
+        echo "  [WARN] machineConfig.enabled but config file not found at $_mc_file"
+      else
+        echo "  [INFO] reading machine config from $_mc_file"
+        # Extract ALL kms endpoints across all disk/partition entries.
+        # Take the first non-empty one (they are typically the same KMS server).
+        _mc_kms=$(yq e '
+          .machine.systemDiskEncryption
+          | to_entries[]
+          | .value.keys[]
+          | select(.kms != null)
+          | .kms.endpoint
+          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | head -1)
+        if [ -n "$_mc_kms" ]; then
+          echo "  [INFO] machine config: detected KMS endpoint: $_mc_kms"
+        fi
+        # Extract ALL static passphrases across all disk/partition entries.
+        # Take the first non-empty one.
+        _mc_static=$(yq e '
+          .machine.systemDiskEncryption
+          | to_entries[]
+          | .value.keys[]
+          | select(.static != null)
+          | .static.passphrase
+          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | head -1)
+        if [ -n "$_mc_static" ]; then
+          echo "  [INFO] machine config: found static passphrase"
+        fi
+      fi
+      {{- end }}
+
+      _kms_host=$(printf '%s' "${KMS_ENDPOINT:-${_mc_kms:-}}" | sed 's|^https://||')
       _kms_available=false
       if [ -n "$_kms_host" ]; then
         _kms_available=true
@@ -294,6 +335,14 @@ data:
           echo "  [WARN] static key secret $TALOS_STATIC_KEY_NS/$TALOS_STATIC_KEY_SECRET not found or empty"
         fi
       fi
+      {{- if .Values.talos.machineConfig.enabled }}
+      # Fall back to machine config static passphrase only when an explicit
+      # Kubernetes secret is not configured.
+      if [ -z "$_static_key_b64" ] && [ -n "${_mc_static:-}" ]; then
+        _static_key_b64=$(printf '%s' "$_mc_static" | base64 | tr -d '\n')
+        echo "  [INFO] using static passphrase from machine config"
+      fi
+      {{- end }}
 
       if ! $_kms_available && [ -z "$_static_key_b64" ]; then
         echo "  [ERROR] no unlock path available: KMS endpoint is empty/unreachable and no static key configured"

@@ -67,6 +67,10 @@ spec:
                   value: {{ .Values.talos.staticKey.secretName | quote }}
                 - name: TALOS_STATIC_KEY_FIELD
                   value: {{ .Values.talos.staticKey.secretKey | quote }}
+                {{- if and .Values.talos.enabled .Values.talos.machineConfig.enabled }}
+                - name: TALOS_MC_PATH
+                  value: /host-talos-state
+                {{- end }}
                 - name: CHART_NAMESPACE
                   value: {{ include "luks-trim.namespace" . | quote }}
                 - name: WORKER_IMAGE
@@ -153,6 +157,7 @@ spec:
                       --arg tskns      "$TALOS_STATIC_KEY_NS" \
                       --arg tsksec     "$TALOS_STATIC_KEY_SECRET" \
                       --arg tskfield   "$TALOS_STATIC_KEY_FIELD" \
+                      --arg mcpath     "${TALOS_MC_PATH:-}" \
                       --argjson tols   "$TOLERATIONS_JSON" \
                       --argjson res    "$WORKER_RESOURCES_JSON" \
                       --argjson ips    "$IMAGE_PULL_SECRETS_JSON" \
@@ -209,19 +214,19 @@ spec:
                                   {name: "TALOS_STATIC_KEY_NS",        value: $tskns},
                                   {name: "TALOS_STATIC_KEY_SECRET",    value: $tsksec},
                                   {name: "TALOS_STATIC_KEY_FIELD",     value: $tskfield}
-                                ],
+                                ] + (if $mcpath != "" then [{name: "TALOS_MC_PATH", value: $mcpath}] else [] end),
                                 command: ["/bin/sh", "/scripts/trim.sh"],
                                 volumeMounts: [
                                   {name: "dev",         mountPath: "/dev"},
                                   {name: "host-ssl",    mountPath: "/etc/ssl/certs", readOnly: true},
                                   {name: "trim-script", mountPath: "/scripts",       readOnly: true}
-                                ]
+                                ] + (if $mcpath != "" then [{name: "host-talos-state", mountPath: $mcpath, readOnly: true}] else [] end)
                               }],
                               volumes: [
                                 {name: "dev",         hostPath: {path: "/dev"}},
                                 {name: "host-ssl",    hostPath: {path: "/etc/ssl/certs", type: "Directory"}},
                                 {name: "trim-script", configMap: {name: $cm, defaultMode: 493}}
-                              ]
+                              ] + (if $mcpath != "" then [{name: "host-talos-state", hostPath: {path: {{ .Values.talos.machineConfig.hostPath | default "/system/state" | quote }}, type: "Directory"}}] else [] end)
                             }
                           }
                         }

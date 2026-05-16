@@ -189,6 +189,44 @@ talos:
     # Key within secret.data that holds the passphrase.
     secretKey: "passphrase"
 
+  # -- Machine config auto-detection --
+  # When enabled, the worker mounts the Talos host state directory
+  # (/system/state) as a read-only hostPath and reads the machine config
+  # directly from the node filesystem. This allows the chart to:
+  #
+  #   1. Auto-detect the KMS endpoint from
+  #      machine.machine.systemDiskEncryption.*.keys[].kms.endpoint
+  #      removing the need to set talos.kmsEndpoint manually.
+  #
+  #   2. Auto-detect static passphrases from
+  #      machine.machine.systemDiskEncryption.*.keys[].static.passphrase
+  #      removing the need to manage a separate Kubernetes Secret for
+  #      talos.staticKey when you are comfortable with the security
+  #      trade-off of mounting the host config file.
+  #
+  # Security considerations:
+  #   - The Talos machine config at /system/state/config.yaml contains
+  #     plaintext secrets (static passphrases, certificates, etc.).
+  #   - Worker pods already run privileged with hostPID=true; the
+  #     additional hostPath mount does not significantly change the
+  #     threat model for those pods.
+  #   - The mount is read-only and scoped to /system/state only.
+  #   - Explicitly disabled by default — opt in deliberately.
+  #
+  # When machineConfig.enabled is true:
+  #   - KMS endpoint is read from the config if talos.kmsEndpoint is empty.
+  #   - Static passphrase is read from the config if talos.staticKey is
+  #     not explicitly configured. machineConfig takes lower precedence
+  #     than an explicit talos.staticKey secret.
+  #   - The kmsEndpoint render-time validation is relaxed: a missing
+  #     kmsEndpoint is only an error if both staticKey and machineConfig
+  #     are disabled.
+  machineConfig:
+    enabled: false
+    # Path to the Talos state directory on the host node.
+    # Change only if running a non-standard Talos layout.
+    hostPath: /system/state
+
 # ---------------------------------------------------------------------------
 # grpcurl — embedded in the custom worker image; no runtime download.
 # ---------------------------------------------------------------------------
