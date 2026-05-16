@@ -1,17 +1,16 @@
 {{- if .Values.createNamespace }}
 {{- /*
   Always render this resource so that Helm owns the namespace and its labels.
-  On a fresh cluster Helm creates it; on a pre-existing namespace Helm patches
-  it (server-side apply), so labels are always reconciled.
 
-  Use `helm upgrade --install --server-side --create-namespace …` to avoid
-  "already exists" errors when the namespace pre-dates the Helm release.
-  `--create-namespace` ensures the namespace exists before Helm stores its
-  release secret; `--server-side` makes every resource (including this
-  Namespace) use a PATCH rather than a CREATE, so pre-existing namespaces
-  are updated instead of rejected.
+  Helm 4 uses server-side apply (SSA) by default, so this resource is always
+  applied as a PATCH rather than a CREATE.  Labels are reconciled on every
+  helm upgrade, whether the namespace is brand-new or already existed before
+  the chart was installed.
 
-  To manage the namespace entirely outside the chart set:
+  With Helm 3 (--server-side flag required for the same behaviour):
+    helm upgrade --install --server-side --create-namespace ...
+
+  To manage the namespace entirely outside the chart, set:
     createNamespace: false
 */}}
 apiVersion: v1
