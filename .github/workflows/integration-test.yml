@@ -773,11 +773,13 @@ jobs:
             TAG="latest"
           fi
 
-          # Helm 4 uses server-side apply by default, so the Namespace template
-          # patches labels onto pre-existing namespaces rather than failing
-          # with "already exists".  --create-namespace ensures the namespace
-          # exists before Helm stores its release secret.
+          # --server-side=true uses server-side apply (PATCH) for every resource,
+          # so the Namespace template patches labels onto pre-existing namespaces
+          # instead of issuing a CREATE that would fail with "already exists".
+          # --create-namespace ensures the namespace exists before Helm stores
+          # its release secret (required even with SSA).
           helm upgrade --install luks-trim . \
+            --server-side=true \
             --namespace   luks-trim \
             --create-namespace \
             --set image.repository="${REPO}" \
