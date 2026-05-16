@@ -248,7 +248,9 @@ jobs:
           # logs/artifacts while the VM disk is preallocated.
           RESERVED_MIB=12288
           MIN_DISK_MIB=10240
-          MAX_DISK_MIB=12288
+          # Allow a larger VM disk when runner capacity permits to reduce
+          # kubelet DiskPressure/ephemeral-storage evictions during T1+.
+          MAX_DISK_MIB=20480
           TALOS_DISK_MIB=$(( AVAILABLE_MIB - RESERVED_MIB ))
 
           if (( TALOS_DISK_MIB > MAX_DISK_MIB )); then
