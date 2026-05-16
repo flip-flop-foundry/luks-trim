@@ -219,7 +219,7 @@ jobs:
               - static:
                   passphrase: ${TALOS_USERVOLUME_STATIC_PASSPHRASE}
                 slot: 0
-                lockToState: true
+                lockToState: false
           EOF
 
           AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
