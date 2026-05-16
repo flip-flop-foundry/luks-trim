@@ -366,7 +366,7 @@ jobs:
       - name: Install QEMU and KVM
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y qemu-system-x86 qemu-kvm cpu-checker
+          sudo apt-get install -y qemu-system-x86 qemu-kvm cpu-checker dnsmasq
           sudo chmod 666 /dev/kvm
           kvm-ok
 
