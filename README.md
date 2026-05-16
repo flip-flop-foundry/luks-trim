@@ -202,6 +202,45 @@ More details from Longhorn docs:
 
 - https://longhorn.io/docs/1.11.2/snapshots-and-backups/scheduling-backups-and-snapshots/
 
+## Technical overview (Longhorn + Talos both enabled)
+
+This is the complete flow when both `longhorn.enabled=true` and `talos.enabled=true`.
+
+### End-to-end flow
+
+1. The cron job spawns a Coordinator which selects target nodes and creates per-node worker Jobs.
+2. Worker discovers Longhorn devices under `/dev/longhorn/*`.
+3. For encrypted Longhorn devices, key discovery order is:
+global key -> per-PVC key -> namespace key list.
+4. Worker applies persistent `allow-discards` on encrypted Longhorn dm-crypt mappings using `cryptsetup ... refresh --persistent`.
+5. Worker discovers Talos unlock material:
+KMS endpoint from `talos.kmsEndpoint` or machine config (when `talos.machineConfig.enabled=true`), plus optional static key.
+6. Worker scans Talos LUKS mappings under `/dev/mapper/luks2-*`, finds `sideroKMS` token data (slots 0-31), unseals via KMS, and falls back to static key when configured.
+7. Worker applies persistent `allow-discards` on Talos LUKS mappings.
+8. Worker runs `fstrim` on Talos-mounted filesystems.
+9. Longhorn `RecurringJob` with task `filesystem-trim` runs separately and trims Longhorn filesystems.
+10. A later Talos-level `fstrim` run propagates those newly freed blocks from node filesystems down to VM/thin-backed storage.
+
+### Why new encrypted Longhorn volumes often need two luks-trim runs
+
+1. Run #1 enables discard flags, but encrypted Longhorn volumes are not trimmed by luks-trim itself.
+2. Longhorn `filesystem-trim` must run to discard free blocks inside Longhorn volumes.
+3. Those freed blocks then become reclaimable at the Talos filesystem layer.
+4. Run #2 (or any later Talos-level fstrim run) is what commonly makes reclaim visible to VM sparse disks / thin pools / hypervisors.
+
+### Troubleshooting checkpoints
+
+1. Confirm Longhorn key discovery and discard enablement in worker logs:
+`kubectl logs -n luks-trim -l luks-trim/role=worker --tail=-1 | grep -E "allow-discards|no matching key|Longhorn"`
+2. Confirm Talos KMS/static path and machine-config detection in worker logs:
+`kubectl logs -n luks-trim -l luks-trim/role=worker --tail=-1 | grep -E "machine config|talos-kms|talos-static|sideroKMS|KMS"`
+3. Confirm Longhorn trim job completed:
+`kubectl -n longhorn-system get recurringjobs.longhorn.io,jobs | grep filesystem-trim`
+4. If reclaim is not visible in hypervisor after first cycle, run the second cycle explicitly:
+run Longhorn `filesystem-trim`, then trigger `luks-trim` again.
+5. Check for common hard failures in worker logs:
+`[ERROR] no matching key found`, `[ERROR] no key unlocked`, `KMS unseal failed`, `not found in mount table`.
+
 ## Security implications of trim on encrypted filesystems
 
 Enabling discard or trim on encrypted storage is a trade-off between reclaim efficiency and metadata leakage.
@@ -221,11 +260,4 @@ Security references:
 
 - https://man7.org/linux/man-pages/man5/crypttab.5.html
 - https://wiki.archlinux.org/title/Dm-crypt/Specialties#Discard/TRIM_support_for_solid_state_drives_(SSD)
-
-## Development and CI
-
-- Integration workflow: [.github/workflows/integration-test.yml](.github/workflows/integration-test.yml)
-- Talos dev debug workflow (branch/worktree debugging): [.github/workflows/talos-dev-debug.yml](.github/workflows/talos-dev-debug.yml)
-- Helper script for GitHub Actions loops: [scripts/gha-loop.sh](scripts/gha-loop.sh)
-
 
