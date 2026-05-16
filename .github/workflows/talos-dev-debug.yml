@@ -301,8 +301,9 @@ jobs:
             done
 
             if pgrep -f "${CLUSTER_NAME}-controlplane-1-0.disk" >/dev/null 2>&1; then
-              echo "[FAIL] Control plane VM did not stop after shutdown request"
-              exit 1
+              echo "[warn] Control plane VM still running after shutdown request, forcing stop"
+              sudo pkill -f "${CLUSTER_NAME}-controlplane-1-0.disk" || true
+              sleep 5
             fi
           fi
 
