@@ -224,8 +224,8 @@ jobs:
           provisioning:
             diskSelector:
               match: disk.transport == 'virtio'
-            minSize: 512MB
-            maxSize: 512MB
+            minSize: 2048MB
+            maxSize: 2048MB
           encryption:
             provider: luks2
             keys:
@@ -2123,7 +2123,31 @@ jobs:
             restartPolicy: Never
           EOF
 
-          kubectl wait pod/t4-talos-uservol-filler -n luks-trim-test --for=condition=Ready --timeout=5m
+          if ! kubectl wait pod/t4-talos-uservol-filler -n luks-trim-test --for=condition=Ready --timeout=5m; then
+            echo "[FAIL] t4-talos-uservol-filler did not become Ready within 5m"
+            echo "[diagnostic] T4 pod state:"
+            kubectl get pod t4-talos-uservol-filler -n luks-trim-test -o wide || true
+            kubectl describe pod t4-talos-uservol-filler -n luks-trim-test || true
+            kubectl logs t4-talos-uservol-filler -n luks-trim-test --all-containers=true --tail=-1 || true
+
+            echo "[diagnostic] T4 PVC state:"
+            kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o wide || true
+            kubectl describe pvc t4-talos-uservol-vol -n luks-trim-test || true
+
+            VOL_NAME=$(kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+            if [[ -n "${VOL_NAME}" ]]; then
+              echo "[diagnostic] Longhorn volume for T4 PVC: ${VOL_NAME}"
+              kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o wide || true
+              kubectl describe volume.longhorn.io "${VOL_NAME}" -n longhorn-system || true
+              kubectl get replicas.longhorn.io -n longhorn-system -o wide | grep "${VOL_NAME}" || true
+            fi
+
+            echo "[diagnostic] Recent namespace events (luks-trim-test):"
+            kubectl get events -n luks-trim-test --sort-by=.lastTimestamp | tail -n 120 || true
+            echo "[diagnostic] Recent namespace events (longhorn-system):"
+            kubectl get events -n longhorn-system --sort-by=.lastTimestamp | tail -n 120 || true
+            exit 1
+          fi
 
           VOL_NAME=$(kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}')
           if [[ -z "${VOL_NAME}" ]]; then
@@ -2259,6 +2283,26 @@ jobs:
 
           echo "=== filler pod events ==="
           kubectl describe pod filler -n luks-trim-test || true
+
+          echo "=== T4 pod/PVC diagnostics ==="
+          kubectl get pod t4-talos-uservol-filler -n luks-trim-test -o wide || true
+          kubectl describe pod t4-talos-uservol-filler -n luks-trim-test || true
+          kubectl logs t4-talos-uservol-filler -n luks-trim-test --all-containers=true --tail=-1 || true
+          kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o wide || true
+          kubectl describe pvc t4-talos-uservol-vol -n luks-trim-test || true
+
+          T4_VOL_NAME=$(kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+          if [[ -n "${T4_VOL_NAME}" ]]; then
+            echo "=== T4 Longhorn volume: ${T4_VOL_NAME} ==="
+            kubectl get volume.longhorn.io "${T4_VOL_NAME}" -n longhorn-system -o wide || true
+            kubectl describe volume.longhorn.io "${T4_VOL_NAME}" -n longhorn-system || true
+            echo "=== T4 Longhorn replicas for ${T4_VOL_NAME} ==="
+            kubectl get replicas.longhorn.io -n longhorn-system -o json \
+              | jq -r --arg vol "${T4_VOL_NAME}" '.items[] | select(.spec.volumeName == $vol) | [.metadata.name, .spec.nodeID, .spec.diskPath, .status.currentState] | @tsv' || true
+          fi
+
+          echo "=== Recent luks-trim-test events (tail) ==="
+          kubectl get events -n luks-trim-test --sort-by=.lastTimestamp | tail -n 120 || true
 
       - name: Destroy Talos QEMU cluster
         if: always()
