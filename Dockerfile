@@ -13,6 +13,7 @@ ARG TARGETARCH
 # jq          → JSON parsing in trim.sh and coordinator
 # curl        → Kubernetes API calls in both scripts
 # ca-certificates → TLS for Kubernetes API + KMS endpoint
+# yq          → YAML parsing for Talos machine config auto-detection
 RUN apt-get update && apt-get install -y --no-install-recommends \
       util-linux \
       cryptsetup \
@@ -20,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       jq \
       curl \
       ca-certificates \
+      yq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install grpcurl from the GitHub release.
@@ -47,6 +49,7 @@ RUN fstrim --version && \
     dmsetup --version && \
     jq --version && \
     curl --version && \
+    yq --version && \
     grpcurl --version
 
 USER root
