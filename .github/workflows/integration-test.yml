@@ -198,6 +198,14 @@ jobs:
               image: factory.talos.dev/installer/${SCHEMATIC_ID}:v${TALOS_VERSION}
           ---
           apiVersion: v1alpha1
+          kind: VolumeConfig
+          name: EPHEMERAL
+          provisioning:
+            diskSelector:
+              match: disk.transport == 'virtio'
+            maxSize: 6GB
+          ---
+          apiVersion: v1alpha1
           kind: UserVolumeConfig
           name: ${TALOS_USERVOLUME_NAME}
           provisioning:
