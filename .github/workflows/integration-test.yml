@@ -1899,7 +1899,23 @@ jobs:
           {"spec":{"disks":{"talos-uservol":{"path":"${TALOS_USERVOLUME_LONGHORN_PATH}","allowScheduling":true,"storageReserved":0,"tags":["talos-uservol"]}}}}
           EOF
           )
-          kubectl patch nodes.longhorn.io "${NODE_NAME}" -n longhorn-system --type merge -p "${PATCH}"
+
+          PATCH_DEADLINE=$(( SECONDS + 180 ))
+          PATCH_OK=0
+          until [[ $SECONDS -ge $PATCH_DEADLINE ]]; do
+            if kubectl patch nodes.longhorn.io "${NODE_NAME}" -n longhorn-system --type merge -p "${PATCH}"; then
+              PATCH_OK=1
+              break
+            fi
+            echo "[monitor] Longhorn node patch rejected (sync in progress), retrying..."
+            sleep 6
+          done
+
+          if [[ "${PATCH_OK}" -ne 1 ]]; then
+            echo "[FAIL] Could not patch Longhorn node disk config before timeout"
+            kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o yaml || true
+            exit 1
+          fi
 
           DEADLINE=$(( SECONDS + 180 ))
           while [[ $SECONDS -lt $DEADLINE ]]; do
