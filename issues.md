@@ -99,10 +99,13 @@ The workflow must provision:
 
 ---
 
-# 2. Support unencrypted volumes
+# 2. Support unencrypted volumes [RESOLVED]
+
+Status (2026-05-16): resolved in the worker script.
 
 Both Talos and Longhorn may have unencrypted volumes co-existing with encrypted ones.
-The current script hard-codes the assumption that all volumes are LUKS2.
+The worker now checks each Longhorn device with `cryptsetup isLuks` and handles
+non-LUKS volumes without attempting key-unlock operations.
 
 ## Approach
 
@@ -126,7 +129,7 @@ No new values are needed — the detection is fully automatic within each path.
 
 ---
 
-# 3. KMS server endpoint cannot be auto-detected from LUKS2 header
+# 3. KMS server endpoint cannot be auto-detected from LUKS2 header [RESOLVED - BY DESIGN]
 
 **Answer: No, the KMS endpoint is not stored in the LUKS2 header.**
 
@@ -146,7 +149,12 @@ is true. Document this clearly. Close this issue as "by design".
 
 ---
 
-# 4. Support additional Talos key types
+# 4. Support additional Talos key types [PARTIALLY RESOLVED]
+
+Status (2026-05-16):
+- static: resolved (implemented via talos.staticKey).
+- nodeID: open.
+- tpm: open.
 
 Talos v1.13 supports four key kinds (ref: https://docs.siderolabs.com/talos/v1.13/configure-your-talos-cluster/storage-and-disk-management/disk-encryption):
 
@@ -157,7 +165,7 @@ Talos v1.13 supports four key kinds (ref: https://docs.siderolabs.com/talos/v1.1
 | `nodeID` | Likely `talos:nodeID` or similar | Derived from node UUID + partition label |
 | `tpm` | TPM-sealed | Requires TPM hardware, out of scope |
 
-## static key support
+## static key support [RESOLVED]
 
 A `static` key is a plain passphrase stored in the Talos machine config. There is
 no LUKS2 token associated with it — the passphrase is used directly as a keyslot
@@ -191,7 +199,11 @@ Requires TPM hardware and interaction with the TPM device from inside the worker
 pod. Out of scope until there is a concrete use case.
 
 
-# 5. Chart improvements
+# 5. Chart improvements [PARTIALLY RESOLVED]
+
+Status (2026-05-16):
+- namespace pod-security labels: resolved (`createNamespace` + `namespaceLabels`).
+- configmap/script readability: improved but still open for future refactoring.
 
 * Maybe we should have ability to add labels to the luks-trim NS for:
 
@@ -203,7 +215,15 @@ pod-security.kubernetes.io/warn=privileged \
 * The currenty configmap/script is very hard to ready, improve this.
 
 
-# 6. Test improvments
+# 6. Test improvments [PARTIALLY RESOLVED]
 
- * At the time of writing we dont have any tests for dry-run on new volumes (volumes that havent had discard enabled)
-  * We should have test cases for this.
+Status (2026-05-16):
+- dry-run coverage for new volumes: resolved (T0 flow in integration workflow).
+- verify qemu-level reclaim: open.
+- two-disk matrix (no encryption/static encryption): open.
+
+- [RESOLVED] Add dry-run coverage for new volumes (volumes that have not had discard enabled).
+- [OPEN] Verify that underlying qemu storage observes reclaimed space.
+- [OPEN] Add a two-drive Talos test matrix and run all tests on both:
+  - no encryption
+  - static encryption

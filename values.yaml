@@ -160,7 +160,7 @@ talos:
   enabled: false
 
   # gRPC endpoint of the Talos KMS server used to unseal LUKS2 volume keys.
-  # Required when talos.enabled is true and sideroKMS key slots are present.
+  # Required when talos.enabled is true and KMS key slots are used.
   # Format: https://<host>:<port>  (scheme is required; stripped internally)
   kmsEndpoint: ""
   # Example: kmsEndpoint: "https://kms.example.com:50051"
@@ -188,16 +188,6 @@ talos:
     secretNamespace: ""
     # Key within secret.data that holds the passphrase.
     secretKey: "passphrase"
-
-# ---------------------------------------------------------------------------
-# grpcurl — embedded in the custom worker image; no runtime download.
-# ---------------------------------------------------------------------------
-# grpcurl is baked into the worker image at build time with checksum
-# verification (see Dockerfile). The version below is informational only
-# and is used as an ARG during the Docker build via the GitHub Actions workflow.
-# To upgrade grpcurl, bump this value and re-run the build workflow.
-grpcurl:
-  version: "1.9.3"
 
 # ---------------------------------------------------------------------------
 # Node selection — nodeLabelSelector vs excludedNodes

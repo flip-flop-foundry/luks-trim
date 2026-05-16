@@ -76,23 +76,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free runner disk space
-        if: ${{ false }} # Temporarily disabled to speed up workflow iteration.
-        run: |
-          echo "[info] disk usage before cleanup"
-          df -h
-
-          # Remove large, unused preinstalled toolchains from ubuntu-latest.
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/lib/android || true
-
-          docker system prune -af || true
-          sudo apt-get clean || true
-
-          echo "[info] disk usage after cleanup"
-          df -h
-
       # ======================================================================
       # 1. SYSTEM DEPENDENCIES
       # ======================================================================
@@ -1079,6 +1062,9 @@ jobs:
             echo "===== [events:${section}] END ====="
           }
 
+          PREV_JOBS=$(kubectl get jobs -n luks-trim \
+            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
 
           # Poll coordinator progress with concise status output.
@@ -1127,10 +1113,14 @@ jobs:
           DEADLINE=$(( SECONDS + 60 ))
           WORKER_JOB=""
           until [[ $SECONDS -ge $DEADLINE ]]; do
-            WORKER_JOB=$(kubectl get jobs -n luks-trim \
+            for NEW_JOB in $(kubectl get jobs -n luks-trim \
               -l "luks-trim/role=worker" \
               --sort-by='.metadata.creationTimestamp' \
-              -o name 2>/dev/null | tail -1 | sed 's|job.batch/||')
+              -o name 2>/dev/null | sed 's|job.batch/||'); do
+              if ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
+                WORKER_JOB="$NEW_JOB"
+              fi
+            done
             [[ -n "$WORKER_JOB" ]] && break
             sleep 3
           done
@@ -1196,7 +1186,7 @@ jobs:
             -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
 
           ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
-          echo "[INFO] lines in worker logs: ${ERROR_COUNT}"
+          echo "[INFO] [ERROR] lines in worker logs: ${ERROR_COUNT}"
           if [[ "${ERROR_COUNT}" -gt 0 ]]; then
             echo "[FAIL] Worker pod logged ERROR lines:"
             echo "$WORKER_LOGS" | grep '\[ERROR\]'
@@ -1462,7 +1452,7 @@ jobs:
           ERROR_COUNT=$(echo "$LOGS"  | grep -c '\[ERROR\]'   || true)
 
           echo "[dry-run] log lines : ${DRYRUN_COUNT}"
-          echo "[INFO]   log lines : ${ERROR_COUNT}"
+          echo "[INFO] [ERROR] log lines : ${ERROR_COUNT}"
 
           if [[ "${DRYRUN_COUNT}" -eq 0 ]]; then
             if echo "$LOGS" | grep -q "allow_discards already active, skipping"; then

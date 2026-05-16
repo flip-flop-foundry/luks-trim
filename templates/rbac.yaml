@@ -67,8 +67,9 @@ subjects:
     name: {{ include "luks-trim.serviceAccountName" . }}
     namespace: {{ include "luks-trim.namespace" . }}
 ---
-# Role: coordinator creates one Job per node, then optionally deletes stale
-# Jobs from previous runs. Scoped to the chart namespace only.
+# Role: coordinator creates one Job per node by listing/creating Jobs in the
+# chart namespace. Completed Jobs are cleaned up automatically by Kubernetes
+# TTLAfterFinished using .Values.ttlSecondsAfterFinished.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

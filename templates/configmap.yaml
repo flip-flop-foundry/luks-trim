@@ -84,8 +84,15 @@ data:
     try_key() {
       _dev="$1"; _name="$2"; _key_b64="$3"; _label="$4"
       [ -z "$_key_b64" ] && return 1
-      _tmpkey=$(mktemp)
-      printf '%s' "$_key_b64" | base64 -d > "$_tmpkey"
+      _tmpkey=$(mktemp) || {
+        echo "    $_label: [ERROR] failed to create temporary key file"
+        return 1
+      }
+      if ! printf '%s' "$_key_b64" | base64 -d > "$_tmpkey" 2>/dev/null; then
+        echo "    $_label: [ERROR] failed to decode key payload (base64)"
+        rm -f "$_tmpkey"
+        return 1
+      fi
       _flags=$(cryptsetup luksDump "$_dev" 2>/dev/null \
         | grep "^Flags:" | sed 's/Flags:[[:space:]]*//')
       if printf '%s' "$_flags" | grep -q "allow-discards"; then
