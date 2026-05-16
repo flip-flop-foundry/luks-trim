@@ -601,6 +601,7 @@ jobs:
             --namespace   longhorn-system \
             --version     "${LONGHORN_VERSION}" \
             --set         defaultSettings.defaultReplicaCount=1 \
+              --set         defaultSettings.storageMinimalAvailablePercentage=10 \
             --wait \
             --timeout     20m >/tmp/longhorn-install.log 2>&1 &
             LONGHORN_HELM_PID=$!
