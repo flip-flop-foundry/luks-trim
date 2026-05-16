@@ -88,6 +88,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free runner disk space
+        run: |
+          echo "[info] disk usage before cleanup"
+          df -h
+
+          # Remove large, unused preinstalled toolchains from ubuntu-latest.
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+          echo "[info] disk usage after cleanup"
+          df -h
+
       # ======================================================================
       # 1. SYSTEM DEPENDENCIES
       # ======================================================================
