@@ -239,7 +239,7 @@ jobs:
           fi
 
           sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
-          talosctl --talosconfig "$TALOSCONFIG" version
+          talosctl version --client
 
       - name: Stage Talos diagnostics artifact
         if: always()
@@ -253,7 +253,7 @@ jobs:
           fi
 
           if [[ -d "$HOME/.talos" ]]; then
-            cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos" || true
+            sudo cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos" || true
           fi
 
           if sudo test -d /root/.talos; then
