@@ -235,16 +235,16 @@ jobs:
           rm -rf "$ARTIFACT_DIR"
           mkdir -p "$ARTIFACT_DIR"
 
-          if [[ -f "$TALOSCONFIG" ]]; then
-            cp "$TALOSCONFIG" "$ARTIFACT_DIR/talosconfig"
+          if sudo test -f "$TALOSCONFIG"; then
+            sudo cp "$TALOSCONFIG" "$ARTIFACT_DIR/talosconfig" || true
           fi
 
           if [[ -d "$HOME/.talos" ]]; then
-            cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos"
+            cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos" || true
           fi
 
           if sudo test -d /root/.talos; then
-            sudo cp -a /root/.talos "$ARTIFACT_DIR/root-talos"
+            sudo cp -a /root/.talos "$ARTIFACT_DIR/root-talos" || true
           fi
 
           sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
