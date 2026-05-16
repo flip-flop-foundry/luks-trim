@@ -800,7 +800,7 @@ jobs:
             storageClassName: luks-global-key
             resources:
               requests:
-                storage: 5Gi
+                  storage: 3Gi
           ---
           apiVersion: v1
           kind: Pod
