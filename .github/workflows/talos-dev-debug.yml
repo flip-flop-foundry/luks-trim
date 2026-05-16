@@ -255,13 +255,23 @@ jobs:
           mkdir -p "$SNAP_DIR"
 
           DISK_PATH="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1-0.disk"
+          FLASH0_PATH="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1-flash0.img"
+          FLASH1_PATH="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1-flash1.img"
+
           if [[ ! -f "$DISK_PATH" ]]; then
             echo "[FAIL] Snapshot disk not found at ${DISK_PATH}"
             exit 1
           fi
 
+          if [[ ! -f "$FLASH0_PATH" || ! -f "$FLASH1_PATH" ]]; then
+            echo "[FAIL] Snapshot flash images missing (${FLASH0_PATH}, ${FLASH1_PATH})"
+            exit 1
+          fi
+
           # Keep raw sparse disk format: no convert step needed during restore.
           cp --sparse=always "$DISK_PATH" "$SNAP_DIR/controlplane-1.disk"
+          cp --sparse=always "$FLASH0_PATH" "$SNAP_DIR/flash0.img"
+          cp --sparse=always "$FLASH1_PATH" "$SNAP_DIR/flash1.img"
 
           if [[ ! -f "$TALOSCONFIG" ]]; then
             echo "[FAIL] Expected talosconfig not found at ${TALOSCONFIG}"
@@ -395,16 +405,26 @@ jobs:
           name: talos-dev-snapshot-${{ github.run_id }}
           path: /tmp/talos-dev-snapshot
 
-      - name: Restore cluster from snapshot and verify node is reachable
+      - name: Boot snapshot VM and verify node is reachable
         env:
           TALOS_VERSION: ${{ needs.talos-dev-debug.outputs.talos-version }}
-          GENERATED_TALOSCONFIG: ${{ github.workspace }}/generated-restore-talosconfig
           RESTORED_TALOSCONFIG: /tmp/talos-dev-snapshot/talosconfig
           KUBECONFIG: ${{ github.workspace }}/restore-kubeconfig
         run: |
           SNAPSHOT_DISK=/tmp/talos-dev-snapshot/controlplane-1.disk
+          FLASH0=/tmp/talos-dev-snapshot/flash0.img
+          FLASH1=/tmp/talos-dev-snapshot/flash1.img
+          BRIDGE_NAME=talosrestore0
+          TAP_NAME=taprestore0
+
           if [[ ! -f "$SNAPSHOT_DISK" ]]; then
             echo "[FAIL] Snapshot disk missing at ${SNAPSHOT_DISK}"
+            ls -R /tmp/talos-dev-snapshot || true
+            exit 1
+          fi
+
+          if [[ ! -f "$FLASH0" || ! -f "$FLASH1" ]]; then
+            echo "[FAIL] Snapshot flash images missing"
             ls -R /tmp/talos-dev-snapshot || true
             exit 1
           fi
@@ -415,29 +435,69 @@ jobs:
             exit 1
           fi
 
-          set +e
-          timeout --signal=TERM 120s sudo --preserve-env=HOME talosctl cluster create dev \
-            --name "$RESTORE_CLUSTER_NAME" \
-            --arch amd64 \
-            --controlplanes 1 \
-            --workers 0 \
-            --disk-image-path "$SNAPSHOT_DISK" \
-            --disk-preallocate=false \
-            --memory "4096MiB" \
-            --cpus "2.0" \
-            --talos-version "v${TALOS_VERSION}" \
-            --talosconfig "$GENERATED_TALOSCONFIG" \
-            --wait-timeout 20m
-          CREATE_RC=$?
-          set -e
+          # Remove stale interfaces from previous attempts if they exist.
+          sudo ip link set "$TAP_NAME" down >/dev/null 2>&1 || true
+          sudo ip tuntap del dev "$TAP_NAME" mode tap >/dev/null 2>&1 || true
+          sudo ip link set "$BRIDGE_NAME" down >/dev/null 2>&1 || true
+          sudo ip link del "$BRIDGE_NAME" type bridge >/dev/null 2>&1 || true
 
-          # Restore workflow intentionally treats create as a launcher that sets
-          # up networking and starts QEMU from the snapshot disk.
-          echo "[info] restore launcher exit code: ${CREATE_RC}"
+          sudo ip link add "$BRIDGE_NAME" type bridge
+          sudo ip addr add 10.5.0.1/24 dev "$BRIDGE_NAME"
+          sudo ip link set "$BRIDGE_NAME" up
+
+          sudo ip tuntap add dev "$TAP_NAME" mode tap
+          sudo ip link set "$TAP_NAME" master "$BRIDGE_NAME"
+          sudo ip link set "$TAP_NAME" up
+
+          # DHCP server leases 10.5.0.2, matching the Talos lab network used by
+          # the original cluster build.
+          sudo dnsmasq \
+            --interface="$BRIDGE_NAME" \
+            --bind-interfaces \
+            --except-interface=lo \
+            --dhcp-range=10.5.0.2,10.5.0.2,255.255.255.0,1h \
+            --dhcp-option=3,10.5.0.1 \
+            --dhcp-option=6,10.5.0.1 \
+            --port=0 \
+            --pid-file=/tmp/dnsmasq-restore.pid \
+            --log-facility=/tmp/dnsmasq-restore.log
+
+          sudo nohup qemu-system-x86_64 \
+            -m 4096 \
+            -smp cpus=2 \
+            -cpu max \
+            -nographic \
+            -netdev tap,id=net0,ifname="$TAP_NAME",script=no,downscript=no \
+            -device virtio-net-pci,netdev=net0,mac=26:13:11:1c:7b:76,host_mtu=1500 \
+            -device virtio-rng-pci \
+            -device virtio-balloon,deflate-on-oom=on \
+            -no-reboot \
+            -boot order=c,reboot-timeout=5000 \
+            -drive id=virtio0,format=raw,if=none,file="$SNAPSHOT_DISK",cache=none \
+            -device virtio-blk-pci,drive=virtio0,logical_block_size=512,physical_block_size=512 \
+            -machine q35,accel=kvm,smm=on \
+            -drive file="$FLASH0",format=raw,if=pflash \
+            -drive file="$FLASH1",format=raw,if=pflash \
+            >/tmp/restore-qemu.log 2>&1 &
+
+          sleep 5
+          if ! pgrep -f "qemu-system-x86_64.*controlplane-1.disk" >/dev/null 2>&1; then
+            echo "[FAIL] QEMU restore VM did not stay running"
+            tail -n 200 /tmp/restore-qemu.log || true
+            exit 1
+          fi
 
           sudo chown "$(id -u):$(id -g)" "$RESTORED_TALOSCONFIG" || true
 
-          TALOS_NODE=$(talosctl --talosconfig "$RESTORED_TALOSCONFIG" config info -o yaml | awk '
+          ACTIVE_TALOSCONFIG=/tmp/restore-active-talosconfig
+          cp "$RESTORED_TALOSCONFIG" "$ACTIVE_TALOSCONFIG"
+
+          # Use the node directly; no load balancer process is involved in this
+          # direct restore boot path.
+          talosctl --talosconfig "$ACTIVE_TALOSCONFIG" config endpoint 10.5.0.2
+          talosctl --talosconfig "$ACTIVE_TALOSCONFIG" config node 10.5.0.2
+
+          TALOS_NODE=$(talosctl --talosconfig "$ACTIVE_TALOSCONFIG" config info -o yaml | awk '
             /^nodes:/ {in_nodes=1; in_endpoints=0; next}
             /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
             /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
@@ -445,7 +505,7 @@ jobs:
           ')
 
           if [[ -z "$TALOS_NODE" ]]; then
-            TALOS_NODE=$(talosctl --talosconfig "$RESTORED_TALOSCONFIG" config info -o yaml | awk '
+            TALOS_NODE=$(talosctl --talosconfig "$ACTIVE_TALOSCONFIG" config info -o yaml | awk '
               /^endpoints:/ {in_endpoints=1; next}
               /^[^[:space:]-]/ {in_endpoints=0}
               in_endpoints && $1 == "-" {print $2; exit}
@@ -458,26 +518,34 @@ jobs:
           fi
 
           for _ in $(seq 1 60); do
-            if talosctl --talosconfig "$RESTORED_TALOSCONFIG" --nodes "$TALOS_NODE" get members >/tmp/restore-members.log 2>&1; then
+            if talosctl --talosconfig "$ACTIVE_TALOSCONFIG" --nodes "$TALOS_NODE" get members >/tmp/restore-members.log 2>&1; then
               break
             fi
             sleep 5
           done
 
-          if ! talosctl --talosconfig "$RESTORED_TALOSCONFIG" --nodes "$TALOS_NODE" get members >/tmp/restore-members.log 2>&1; then
+          if ! talosctl --talosconfig "$ACTIVE_TALOSCONFIG" --nodes "$TALOS_NODE" get members >/tmp/restore-members.log 2>&1; then
             echo "[FAIL] Restored Talos API was not reachable"
             sed -n '1,40p' /tmp/restore-members.log || true
+            tail -n 200 /tmp/restore-qemu.log || true
             exit 1
           fi
 
-          talosctl --talosconfig "$RESTORED_TALOSCONFIG" kubeconfig --nodes "$TALOS_NODE" --merge=false /tmp/kubeconfig
+          talosctl --talosconfig "$ACTIVE_TALOSCONFIG" kubeconfig --nodes "$TALOS_NODE" --merge=false /tmp/kubeconfig
           sudo cp /tmp/kubeconfig "$KUBECONFIG"
           sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
 
           kubectl --kubeconfig "$KUBECONFIG" wait node --all --for=condition=Ready --timeout=5m
           kubectl --kubeconfig "$KUBECONFIG" get nodes -o wide
 
-      - name: Destroy restored Talos cluster
+      - name: Cleanup restored VM and network
         if: always()
         run: |
-          sudo --preserve-env=HOME talosctl cluster destroy --name "$RESTORE_CLUSTER_NAME" || true
+          sudo pkill -f "qemu-system-x86_64.*controlplane-1.disk" || true
+          if [[ -f /tmp/dnsmasq-restore.pid ]]; then
+            sudo kill "$(cat /tmp/dnsmasq-restore.pid)" || true
+          fi
+          sudo ip link set taprestore0 down >/dev/null 2>&1 || true
+          sudo ip tuntap del dev taprestore0 mode tap >/dev/null 2>&1 || true
+          sudo ip link set talosrestore0 down >/dev/null 2>&1 || true
+          sudo ip link del talosrestore0 type bridge >/dev/null 2>&1 || true
