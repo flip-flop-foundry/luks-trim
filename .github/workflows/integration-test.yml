@@ -1101,6 +1101,31 @@ jobs:
                   claimName: test-vol
             restartPolicy: Never
           EOF
+
+          # Fail faster if Longhorn already marks the provisioned volume as
+          # faulted/unschedulable before pod readiness wait expires.
+          VOL_NAME=""
+          for _ in $(seq 1 15); do
+            VOL_NAME=$(kubectl get pvc test-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+            [[ -n "${VOL_NAME}" ]] && break
+            sleep 2
+          done
+
+          if [[ -n "${VOL_NAME}" ]]; then
+            for _ in $(seq 1 18); do
+              VOL_STATE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.state}' 2>/dev/null || true)
+              if [[ "${VOL_STATE}" == "faulted" ]]; then
+                echo "[FAIL] Longhorn volume ${VOL_NAME} became faulted before pod readiness"
+                kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o wide || true
+                kubectl describe volume.longhorn.io "${VOL_NAME}" -n longhorn-system || true
+                kubectl get nodes.longhorn.io -n longhorn-system -o wide || true
+                kubectl logs -n longhorn-system -l app=longhorn-manager --tail=80 || true
+                exit 1
+              fi
+              sleep 2
+            done
+          fi
+
           if ! kubectl wait pod/filler -n luks-trim-test \
             --for=condition=Ready --timeout=2m; then
             echo "[FAIL] filler did not become Ready within 2m"
@@ -2200,6 +2225,9 @@ jobs:
 
           echo "=== Longhorn volumes ==="
           kubectl get volume.longhorn.io -n longhorn-system -o wide || true
+
+          echo "=== Longhorn nodes ==="
+          kubectl get nodes.longhorn.io -n longhorn-system -o wide || true
 
           echo "=== luks-trim jobs ==="
           kubectl get jobs -n luks-trim -o wide || true
