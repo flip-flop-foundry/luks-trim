@@ -20,7 +20,9 @@ concurrency:
 
 env:
   CLUSTER_NAME: luks-trim-dev-debug
+  RESTORE_CLUSTER_NAME: luks-trim-dev-debug-restore
   TALOSCONFIG: ${{ github.workspace }}/talosconfig
+  KUBECONFIG: ${{ github.workspace }}/kubeconfig
 
 jobs:
   talos-dev-debug:
@@ -28,6 +30,8 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+    outputs:
+      talos-version: ${{ steps.talos.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -241,7 +245,36 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
           talosctl version --client
 
-      - name: Stage Talos diagnostics artifact
+      - name: Stage restore snapshot artifact
+        if: success()
+        env:
+          TALOS_VERSION: ${{ steps.talos.outputs.version }}
+        run: |
+          SNAP_DIR=/tmp/talos-dev-snapshot
+          rm -rf "$SNAP_DIR"
+          mkdir -p "$SNAP_DIR"
+
+          DISK_PATH="${HOME}/.talos/clusters/${CLUSTER_NAME}/${CLUSTER_NAME}-controlplane-1-0.disk"
+          if [[ ! -f "$DISK_PATH" ]]; then
+            echo "[FAIL] Snapshot disk not found at ${DISK_PATH}"
+            exit 1
+          fi
+
+          # Keep raw sparse disk format: no convert step needed during restore.
+          cp --sparse=always "$DISK_PATH" "$SNAP_DIR/controlplane-1.disk"
+          printf 'talos_version=%s\n' "$TALOS_VERSION" > "$SNAP_DIR/metadata.env"
+          ls -lh "$SNAP_DIR"
+
+      - name: Upload restore snapshot artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: talos-dev-snapshot-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: error
+          path: /tmp/talos-dev-snapshot
+
+      - name: Stage compact diagnostics artifact
         if: always()
         run: |
           ARTIFACT_DIR=/tmp/talos-dev-debug-artifact
@@ -252,15 +285,17 @@ jobs:
             sudo cp "$TALOSCONFIG" "$ARTIFACT_DIR/talosconfig" || true
           fi
 
-          if [[ -d "$HOME/.talos" ]]; then
-            sudo cp -a "$HOME/.talos" "$ARTIFACT_DIR/runner-talos" || true
+          CLUSTER_DIR="${HOME}/.talos/clusters/${CLUSTER_NAME}"
+          if sudo test -d "$CLUSTER_DIR"; then
+            sudo mkdir -p "$ARTIFACT_DIR/cluster"
+            sudo cp -a "$CLUSTER_DIR/." "$ARTIFACT_DIR/cluster/" || true
           fi
 
           if sudo test -d /root/.talos; then
             sudo cp -a /root/.talos "$ARTIFACT_DIR/root-talos" || true
           fi
 
-          # Exclude large raw VM disk files to keep artifact inspection practical.
+          # Keep diagnostics artifact small: raw disk is uploaded separately.
           find "$ARTIFACT_DIR" -type f -name '*.disk' -delete || true
 
           sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
@@ -278,3 +313,116 @@ jobs:
         if: always()
         run: |
           sudo --preserve-env=HOME talosctl cluster destroy --name "$CLUSTER_NAME" || true
+
+  restore-from-snapshot:
+    needs: talos-dev-debug
+    if: needs.talos-dev-debug.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-system-x86 qemu-kvm cpu-checker
+          sudo chmod 666 /dev/kvm
+          kvm-ok
+
+      - name: Install talosctl
+        env:
+          TALOS_VERSION: ${{ needs.talos-dev-debug.outputs.talos-version }}
+        run: |
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Install kubectl
+        run: |
+          STABLE=$(curl -sSfL https://dl.k8s.io/release/stable.txt)
+          curl -sSfL "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Download Talos kernel and initramfs for dev provisioner
+        env:
+          TALOS_VERSION: ${{ needs.talos-dev-debug.outputs.talos-version }}
+        run: |
+          mkdir -p _out
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/vmlinuz-amd64" \
+            -o _out/vmlinuz-amd64
+          curl -sSfL \
+            "https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/initramfs-amd64.xz" \
+            -o _out/initramfs-amd64.xz
+
+      - name: Download restore snapshot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: talos-dev-snapshot-${{ github.run_id }}
+          path: /tmp/talos-dev-snapshot
+
+      - name: Restore cluster from snapshot and verify node is reachable
+        env:
+          TALOS_VERSION: ${{ needs.talos-dev-debug.outputs.talos-version }}
+          TALOSCONFIG: ${{ github.workspace }}/restore-talosconfig
+          KUBECONFIG: ${{ github.workspace }}/restore-kubeconfig
+        run: |
+          SNAPSHOT_DISK=/tmp/talos-dev-snapshot/controlplane-1.disk
+          if [[ ! -f "$SNAPSHOT_DISK" ]]; then
+            echo "[FAIL] Snapshot disk missing at ${SNAPSHOT_DISK}"
+            ls -R /tmp/talos-dev-snapshot || true
+            exit 1
+          fi
+
+          timeout --signal=TERM 30m sudo --preserve-env=HOME talosctl cluster create dev \
+            --name "$RESTORE_CLUSTER_NAME" \
+            --arch amd64 \
+            --controlplanes 1 \
+            --workers 0 \
+            --disk-image-path "$SNAPSHOT_DISK" \
+            --disk-preallocate=false \
+            --memory "4096MiB" \
+            --cpus "2.0" \
+            --talos-version "v${TALOS_VERSION}" \
+            --talosconfig "$TALOSCONFIG" \
+            --wait-timeout 20m
+
+          sudo chown "$(id -u):$(id -g)" "$TALOSCONFIG"
+
+          TALOS_NODE=$(talosctl --talosconfig "$TALOSCONFIG" config info -o yaml | awk '
+            /^nodes:/ {in_nodes=1; in_endpoints=0; next}
+            /^endpoints:/ {in_endpoints=1; in_nodes=0; next}
+            /^[^[:space:]-]/ {in_nodes=0; in_endpoints=0}
+            in_nodes && $1 == "-" {print $2; exit}
+          ')
+
+          if [[ -z "$TALOS_NODE" ]]; then
+            TALOS_NODE=$(talosctl --talosconfig "$TALOSCONFIG" config info -o yaml | awk '
+              /^endpoints:/ {in_endpoints=1; next}
+              /^[^[:space:]-]/ {in_endpoints=0}
+              in_endpoints && $1 == "-" {print $2; exit}
+            ' | sed -E 's#^https?://##; s#:[0-9]+$##')
+          fi
+
+          if [[ -z "$TALOS_NODE" ]]; then
+            echo "[FAIL] Could not determine Talos node from restored talosconfig"
+            exit 1
+          fi
+
+          talosctl --talosconfig "$TALOSCONFIG" kubeconfig --nodes "$TALOS_NODE" --merge=false /tmp/kubeconfig
+          sudo cp /tmp/kubeconfig "$KUBECONFIG"
+          sudo chown "$(id -u):$(id -g)" "$KUBECONFIG"
+
+          kubectl --kubeconfig "$KUBECONFIG" wait node --all --for=condition=Ready --timeout=5m
+          kubectl --kubeconfig "$KUBECONFIG" get nodes -o wide
+
+      - name: Destroy restored Talos cluster
+        if: always()
+        run: |
+          sudo --preserve-env=HOME talosctl cluster destroy --name "$RESTORE_CLUSTER_NAME" || true
