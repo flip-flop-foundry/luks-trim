@@ -289,30 +289,47 @@ data:
         echo "  [WARN] machineConfig.enabled but config file not found at $_mc_file"
       else
         echo "  [INFO] reading machine config from $_mc_file"
-        # Extract ALL kms endpoints across all disk/partition entries.
-        # Take the first non-empty one (they are typically the same KMS server).
+        # Scan for KMS endpoint — check kind: VolumeConfig / UserVolumeConfig
+        # documents first (new multi-document style), then fall back to the
+        # legacy .machine.systemDiskEncryption field in the v1alpha1 document.
+        # The config file is multi-document YAML; yq processes all documents.
         _mc_kms=$(yq e '
-          .machine.systemDiskEncryption
-          | to_entries[]
-          | .value.keys[]
+          select(.kind == "VolumeConfig" or .kind == "UserVolumeConfig")
+          | .encryption.keys[]?
           | select(.kms != null)
           | .kms.endpoint
-          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | head -1)
-        if [ -n "$_mc_kms" ]; then
-          echo "  [INFO] machine config: detected KMS endpoint: $_mc_kms"
+          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | grep -v '^$' | head -1)
+        if [ -z "$_mc_kms" ]; then
+          _mc_kms=$(yq e '
+            select(.machine.systemDiskEncryption != null)
+            | .machine.systemDiskEncryption
+            | to_entries[]?
+            | .value.keys[]?
+            | select(.kms != null)
+            | .kms.endpoint
+            ' "$_mc_file" 2>/dev/null | grep -v '^null$' | grep -v '^$' | head -1)
+          [ -n "$_mc_kms" ] && echo "  [INFO] machine config: KMS endpoint from systemDiskEncryption: $_mc_kms"
+        else
+          echo "  [INFO] machine config: KMS endpoint from VolumeConfig: $_mc_kms"
         fi
-        # Extract ALL static passphrases across all disk/partition entries.
-        # Take the first non-empty one.
+        # Scan for static passphrase — same two-step order.
         _mc_static=$(yq e '
-          .machine.systemDiskEncryption
-          | to_entries[]
-          | .value.keys[]
+          select(.kind == "VolumeConfig" or .kind == "UserVolumeConfig")
+          | .encryption.keys[]?
           | select(.static != null)
           | .static.passphrase
-          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | head -1)
-        if [ -n "$_mc_static" ]; then
-          echo "  [INFO] machine config: found static passphrase"
+          ' "$_mc_file" 2>/dev/null | grep -v '^null$' | grep -v '^$' | head -1)
+        if [ -z "$_mc_static" ]; then
+          _mc_static=$(yq e '
+            select(.machine.systemDiskEncryption != null)
+            | .machine.systemDiskEncryption
+            | to_entries[]?
+            | .value.keys[]?
+            | select(.static != null)
+            | .static.passphrase
+            ' "$_mc_file" 2>/dev/null | grep -v '^null$' | grep -v '^$' | head -1)
         fi
+        [ -n "$_mc_static" ] && echo "  [INFO] machine config: found static passphrase"
       fi
       {{- end }}
 
@@ -345,8 +362,15 @@ data:
       {{- end }}
 
       if ! $_kms_available && [ -z "$_static_key_b64" ]; then
+        {{- if .Values.talos.machineConfig.enabled }}
+        # Nothing found in machine config and no explicit keys configured —
+        # presume this node has no KMS/static encrypted volumes and skip.
+        echo "  [INFO] no KMS endpoint or static key found — assuming no encrypted volumes on this node"
+        return 0
+        {{- else }}
         echo "  [ERROR] no unlock path available: KMS endpoint is empty/unreachable and no static key configured"
         return 1
+        {{- end }}
       fi
 
       _found=false

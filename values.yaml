@@ -226,35 +226,33 @@ talos:
   #   - The kmsEndpoint render-time validation is relaxed: a missing
   #     kmsEndpoint is only an error if both staticKey and machineConfig
   #     are disabled.
+  #   - If neither a KMS endpoint nor a static passphrase is found after
+  #     scanning the machine config, the worker silently skips the KMS and
+  #     static-key paths and assumes the node has no encrypted volumes
+  #     managed by those key types (rather than failing).
+  #
+  # Config file scan order (first match wins):
+  #   The Talos machine config file (/system/state/config.yaml) is
+  #   multi-document YAML. Encryption is declared in three document kinds:
+  #
+  #     kind: VolumeConfig      .encryption.keys[].kms|static
+  #                             → STATE/EPHEMERAL/IMAGE-CACHE (new style)
+  #     kind: UserVolumeConfig  .encryption.keys[].kms|static
+  #                             → User volumes under /var/mnt/<name>
+  #     v1alpha1 (kind unset)   .machine.systemDiskEncryption.*
+  #                             → STATE/EPHEMERAL (legacy style)
+  #
+  #   Auto-detect scans VolumeConfig and UserVolumeConfig documents first,
+  #   then falls back to .machine.systemDiskEncryption. All documents in the
+  #   file are considered; the first non-empty value found is used.
   #
   # Known limitation — single KMS server assumed:
-  #   Talos allows each encrypted disk/partition to reference a different
-  #   KMS server (e.g. system disk → kms-a, user disk → kms-b). This chart
-  #   does NOT yet support per-volume KMS routing. When auto-detecting from
-  #   the machine config, only the first KMS endpoint found is used for all
-  #   volumes on the node. If your cluster uses multiple KMS servers per node
-  #   you must set talos.kmsEndpoint explicitly and ensure all volumes on
-  #   a given node share that endpoint, or split nodes into separate Helm
-  #   releases each targeting a single KMS server.
-  #
-  # Known limitation — only v1alpha1 systemDiskEncryption is scanned:
-  #   The Talos machine config file (/system/state/config.yaml) is a
-  #   multi-document YAML file. Encryption keys can be declared in three
-  #   separate document kinds:
-  #
-  #     v1alpha1 (kind unset)  .machine.systemDiskEncryption.*
-  #                            → STATE and EPHEMERAL partitions (legacy style)
-  #     kind: VolumeConfig     .encryption.keys[].kms.endpoint
-  #                            → STATE/EPHEMERAL/IMAGE-CACHE (new document style)
-  #     kind: UserVolumeConfig .encryption.keys[].kms.endpoint
-  #                            → User volumes under /var/mnt/<name>
-  #
-  #   The current auto-detect implementation only reads
-  #   .machine.systemDiskEncryption from the v1alpha1 document. VolumeConfig
-  #   and UserVolumeConfig documents in the same file are not parsed.
-  #   If your encrypted volumes are configured via those document kinds, set
-  #   talos.kmsEndpoint and talos.staticKey explicitly instead of relying on
-  #   auto-detection.
+  #   Talos allows each encrypted volume to reference a different KMS server.
+  #   This chart does NOT support per-volume KMS routing. Only the first KMS
+  #   endpoint found across all documents is used for all volumes on the node.
+  #   If your node uses multiple KMS servers, set talos.kmsEndpoint explicitly
+  #   and ensure all volumes on that node share the same endpoint, or split
+  #   into separate Helm releases per KMS server.
   machineConfig:
     enabled: false
     # Path to the Talos state directory on the host node.
