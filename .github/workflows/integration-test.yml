@@ -66,7 +66,7 @@ env:
   CLUSTER_NAME: luks-trim-test
   # Temporary CI speed-up switch while iterating on the Talos uservolume path.
   # Set to "true" to run T0-T3 again.
-  RUN_LEGACY_TESTS: "false"
+  RUN_LEGACY_TESTS: "true"
   TALOS_USERVOLUME_NAME: longhorn-uvol
   TALOS_USERVOLUME_STATIC_PASSPHRASE: ci-talos-uservolume-static-passphrase
   TALOS_USERVOLUME_LONGHORN_PATH: /var/mnt/longhorn-uvol/longhorn
