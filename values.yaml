@@ -236,6 +236,25 @@ talos:
   #   you must set talos.kmsEndpoint explicitly and ensure all volumes on
   #   a given node share that endpoint, or split nodes into separate Helm
   #   releases each targeting a single KMS server.
+  #
+  # Known limitation — only v1alpha1 systemDiskEncryption is scanned:
+  #   The Talos machine config file (/system/state/config.yaml) is a
+  #   multi-document YAML file. Encryption keys can be declared in three
+  #   separate document kinds:
+  #
+  #     v1alpha1 (kind unset)  .machine.systemDiskEncryption.*
+  #                            → STATE and EPHEMERAL partitions (legacy style)
+  #     kind: VolumeConfig     .encryption.keys[].kms.endpoint
+  #                            → STATE/EPHEMERAL/IMAGE-CACHE (new document style)
+  #     kind: UserVolumeConfig .encryption.keys[].kms.endpoint
+  #                            → User volumes under /var/mnt/<name>
+  #
+  #   The current auto-detect implementation only reads
+  #   .machine.systemDiskEncryption from the v1alpha1 document. VolumeConfig
+  #   and UserVolumeConfig documents in the same file are not parsed.
+  #   If your encrypted volumes are configured via those document kinds, set
+  #   talos.kmsEndpoint and talos.staticKey explicitly instead of relying on
+  #   auto-detection.
   machineConfig:
     enabled: false
     # Path to the Talos state directory on the host node.
