@@ -1,18 +1,29 @@
 {{- if .Values.createNamespace }}
 {{- /*
-  Always render this resource so that Helm owns the namespace and its labels.
+  Render this Namespace resource so that Helm owns it and can reconcile
+  its labels on every `helm upgrade` (Helm 3-way merge patches the resource
+  on upgrades, applying any namespaceLabels changes automatically).
 
-  Helm 4 uses server-side apply (SSA) by default, so this resource is always
-  applied as a PATCH rather than a CREATE.  Labels are reconciled on every
-  helm upgrade, whether the namespace is brand-new or already existed before
-  the chart was installed.
+  First-install / pre-existing namespace note (Helm 3.21 and earlier):
+    `--create-namespace` pre-creates the namespace before Helm processes
+    templates; Helm's CREATE for this template would then fail with "already
+    exists".  The lookup guard below skips rendering when the namespace is
+    already present, avoiding the conflict.
 
-  With Helm 3 (--server-side flag required for the same behaviour):
-    helm upgrade --install --server-side --create-namespace ...
+    For the integration-test workflow, labels are applied via a
+    `kubectl apply` step that runs BEFORE `helm upgrade --install`.  That
+    pre-step is idempotent: it creates the namespace on a fresh cluster and
+    patches labels on an already-existing one, so pod-security labels are
+    always correct regardless of the cluster state.
 
-  To manage the namespace entirely outside the chart, set:
+    For ArgoCD / FluxCD (server-side apply): SSA turns every apply into a
+    PATCH, so the lookup guard is a no-op and this template is applied
+    correctly on both new and existing namespaces without a pre-step.
+
+  To manage the namespace entirely outside the chart set:
     createNamespace: false
 */}}
+{{- if not (lookup "v1" "Namespace" "" (include "luks-trim.namespace" .)) }}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -22,4 +33,5 @@ metadata:
     {{- with .Values.namespaceLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+{{- end }}
 {{- end }}

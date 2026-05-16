@@ -764,6 +764,25 @@ jobs:
         run: |
           IMAGE="${{ inputs.worker-image }}"
 
+          # Pre-apply the luks-trim namespace with pod-security labels.
+          # Using "kubectl apply" is idempotent: it creates the namespace on
+          # a fresh cluster and patches labels on an already-existing one.
+          # This runs before helm so that helm's --create-namespace (which
+          # pre-creates the namespace without labels for its release-secret
+          # bookkeeping) finds the namespace already present and is a no-op.
+          # The Namespace template in the chart then reconciles the labels on
+          # every subsequent `helm upgrade` via Helm's 3-way merge patch.
+          kubectl apply -f - <<'NSEOF'
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: luks-trim
+            labels:
+              pod-security.kubernetes.io/enforce: privileged
+              pod-security.kubernetes.io/audit: privileged
+              pod-security.kubernetes.io/warn: privileged
+          NSEOF
+
           # Split "repo:tag"; if no colon is present, default tag to "latest".
           if [[ "$IMAGE" == *:* ]]; then
             REPO="${IMAGE%:*}"
@@ -773,13 +792,7 @@ jobs:
             TAG="latest"
           fi
 
-          # --server-side=true uses server-side apply (PATCH) for every resource,
-          # so the Namespace template patches labels onto pre-existing namespaces
-          # instead of issuing a CREATE that would fail with "already exists".
-          # --create-namespace ensures the namespace exists before Helm stores
-          # its release secret (required even with SSA).
           helm upgrade --install luks-trim . \
-            --server-side=true \
             --namespace   luks-trim \
             --create-namespace \
             --set image.repository="${REPO}" \
