@@ -162,6 +162,11 @@ talos:
   # gRPC endpoint of the Talos KMS server used to unseal LUKS2 volume keys.
   # Required when talos.enabled is true and sideroKMS key slots are present.
   # Format: https://<host>:<port>  (scheme is required; stripped internally)
+  #
+  # Note: a single endpoint is used for all volumes on every node. Talos
+  # technically allows different KMS servers per disk/partition, but that
+  # per-volume routing is not supported by this chart. If all your encrypted
+  # volumes share one KMS server (the common case), this is not a concern.
   kmsEndpoint: ""
   # Example: kmsEndpoint: "https://kms.example.com:50051"
 
@@ -221,6 +226,16 @@ talos:
   #   - The kmsEndpoint render-time validation is relaxed: a missing
   #     kmsEndpoint is only an error if both staticKey and machineConfig
   #     are disabled.
+  #
+  # Known limitation — single KMS server assumed:
+  #   Talos allows each encrypted disk/partition to reference a different
+  #   KMS server (e.g. system disk → kms-a, user disk → kms-b). This chart
+  #   does NOT yet support per-volume KMS routing. When auto-detecting from
+  #   the machine config, only the first KMS endpoint found is used for all
+  #   volumes on the node. If your cluster uses multiple KMS servers per node
+  #   you must set talos.kmsEndpoint explicitly and ensure all volumes on
+  #   a given node share that endpoint, or split nodes into separate Helm
+  #   releases each targeting a single KMS server.
   machineConfig:
     enabled: false
     # Path to the Talos state directory on the host node.
