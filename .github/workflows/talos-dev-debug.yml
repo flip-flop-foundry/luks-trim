@@ -415,7 +415,8 @@ jobs:
             exit 1
           fi
 
-          timeout --signal=TERM 30m sudo --preserve-env=HOME talosctl cluster create dev \
+          set +e
+          timeout --signal=TERM 120s sudo --preserve-env=HOME talosctl cluster create dev \
             --name "$RESTORE_CLUSTER_NAME" \
             --arch amd64 \
             --controlplanes 1 \
@@ -426,9 +427,13 @@ jobs:
             --cpus "2.0" \
             --talos-version "v${TALOS_VERSION}" \
             --talosconfig "$GENERATED_TALOSCONFIG" \
-            --wait=false \
-            --skip-kubeconfig \
-            --skip-k8s-node-readiness-check
+            --wait-timeout 20m
+          CREATE_RC=$?
+          set -e
+
+          # Restore workflow intentionally treats create as a launcher that sets
+          # up networking and starts QEMU from the snapshot disk.
+          echo "[info] restore launcher exit code: ${CREATE_RC}"
 
           sudo chown "$(id -u):$(id -g)" "$RESTORED_TALOSCONFIG" || true
 
