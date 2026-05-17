@@ -1646,10 +1646,10 @@ jobs:
       # ======================================================================
       # T3 — T1-STYLE RECLAIM COVERAGE ACROSS REMAINING STORAGE CLASSES
       #
-      # Keep one shared cluster, then run a reusable T1-like flow sequentially
-      # for ns-key, pvc-key, and plain classes:
-      #   create PVC/pod -> write -> delete -> run luks-trim -> trigger
-      #   Longhorn filesystem-trim -> assert reclaim behavior.
+      # Keep one shared cluster and pre-create one pod per namespace with
+      # ns-key, pvc-key, and plain PVCs mounted together. Then do one write/delete
+      # cycle, run luks-trim once, trigger Longhorn trim once, and assert reclaim
+      # for all mounted volumes across both namespaces.
       # ======================================================================
 
       - name: "[T3] Upgrade chart: dryRun=false"
@@ -1659,7 +1659,7 @@ jobs:
             --reuse-values \
             --set dryRun=false
 
-      - name: "[T3] Run T1-style reclaim flow for ns/pvc/plain classes"
+      - name: "[T3] Run single-execution reclaim flow across ns/pvc/plain in two namespaces"
         run: |
           LAST_WORKER_LOGS=""
           LAST_WORKER_JOB=""
@@ -1743,29 +1743,96 @@ jobs:
             echo "[PASS] ${case_label}: worker ${worker_job} completed cleanly (no failure markers in worker log)"
           }
 
-          run_case() {
-            local case_label="$1"
-            local storage_class="$2"
-            local pvc_name="$3"
-            local pod_name="$4"
-            local write_mib="$5"
-            local min_reclaim_mib="$6"
-            local run_luks_trim="$7"
+          create_crypto_secret() {
+            local namespace="$1"
+            local secret_name="$2"
+            local passphrase
+            passphrase=$(openssl rand -base64 32)
+            kubectl create secret generic "${secret_name}" \
+              --namespace "${namespace}" \
+              --from-literal=CRYPTO_KEY_VALUE="${passphrase}" \
+              --from-literal=CRYPTO_KEY_PROVIDER=secret \
+              --from-literal=CRYPTO_KEY_CIPHER=aes-xts-plain64 \
+              --from-literal=CRYPTO_KEY_HASH=sha256 \
+              --from-literal=CRYPTO_KEY_SIZE=256 \
+              --from-literal=CRYPTO_PBKDF=argon2i \
+              --dry-run=client -o yaml | kubectl apply -f -
+          }
 
-            LAST_WORKER_LOGS=""
-            LAST_WORKER_JOB=""
+          write_volume_file() {
+            local namespace="$1"
+            local pod_name="$2"
+            local mount_path="$3"
+            local write_mib="$4"
+            kubectl exec "${pod_name}" -n "${namespace}" -- \
+              dd if=/dev/urandom of="${mount_path}/t3-file.bin" bs=1M count="${write_mib}" status=none
+          }
 
-            echo "===== [T3:${case_label}] storageClass=${storage_class} pvc=${pvc_name} ====="
+          delete_volume_file() {
+            local namespace="$1"
+            local pod_name="$2"
+            local mount_path="$3"
+            kubectl exec "${pod_name}" -n "${namespace}" -- rm -f "${mount_path}/t3-file.bin"
+          }
+
+          declare -a NAMESPACES=("luks-trim-test" "luks-trim-test-alt")
+          declare -a CASES=("ns:luks-ns-key:/data/ns:400" "pvc:luks-pvc-key:/data/pvc:400" "plain:no-encryption:/data/plain:400")
+          WRITE_MIB=512
+
+          declare -A PVC_NAME_BY_KEY
+          declare -A POD_NAME_BY_NS
+          declare -A VOL_NAME_BY_KEY
+          declare -A PRE_TRIM_BY_KEY
+
+          for namespace in "${NAMESPACES[@]}"; do
+            suffix=$(echo "${namespace}" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+            pod_name="t3-${suffix}-filler"
+            ns_pvc="t3-${suffix}-ns-vol"
+            pvc_pvc="t3-${suffix}-pvc-vol"
+            plain_pvc="t3-${suffix}-plain-vol"
+
+            kubectl create namespace "${namespace}" --dry-run=client -o yaml | kubectl apply -f -
+            create_crypto_secret "${namespace}" "luks-ns-shared"
+            create_crypto_secret "${namespace}" "${pvc_pvc}"
+
+            PVC_NAME_BY_KEY["${namespace}:ns"]="${ns_pvc}"
+            PVC_NAME_BY_KEY["${namespace}:pvc"]="${pvc_pvc}"
+            PVC_NAME_BY_KEY["${namespace}:plain"]="${plain_pvc}"
+            POD_NAME_BY_NS["${namespace}"]="${pod_name}"
 
             kubectl apply -f - <<EOF
           apiVersion: v1
           kind: PersistentVolumeClaim
           metadata:
-            name: ${pvc_name}
-            namespace: luks-trim-test
+            name: ${ns_pvc}
+            namespace: ${namespace}
           spec:
             accessModes: [ReadWriteOnce]
-            storageClassName: ${storage_class}
+            storageClassName: luks-ns-key
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ${pvc_pvc}
+            namespace: ${namespace}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-pvc-key
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ${plain_pvc}
+            namespace: ${namespace}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: no-encryption
             resources:
               requests:
                 storage: 1Gi
@@ -1774,104 +1841,138 @@ jobs:
           kind: Pod
           metadata:
             name: ${pod_name}
-            namespace: luks-trim-test
+            namespace: ${namespace}
           spec:
             containers:
               - name: filler
                 image: ubuntu:24.04
                 command: ["sleep", "3600"]
                 volumeMounts:
-                  - name: data
-                    mountPath: /data
+                  - name: ns
+                    mountPath: /data/ns
+                  - name: pvc
+                    mountPath: /data/pvc
+                  - name: plain
+                    mountPath: /data/plain
             volumes:
-              - name: data
+              - name: ns
                 persistentVolumeClaim:
-                  claimName: ${pvc_name}
+                  claimName: ${ns_pvc}
+              - name: pvc
+                persistentVolumeClaim:
+                  claimName: ${pvc_pvc}
+              - name: plain
+                persistentVolumeClaim:
+                  claimName: ${plain_pvc}
             restartPolicy: Never
           EOF
+          done
 
-            kubectl wait pod/"${pod_name}" -n luks-trim-test --for=condition=Ready --timeout=5m
+          for namespace in "${NAMESPACES[@]}"; do
+            kubectl wait pod/"${POD_NAME_BY_NS[${namespace}]}" -n "${namespace}" --for=condition=Ready --timeout=8m
+          done
 
-            kubectl exec "${pod_name}" -n luks-trim-test -- \
-              dd if=/dev/urandom of=/data/t3-file.bin bs=1M count="${write_mib}" status=none
-            kubectl exec "${pod_name}" -n luks-trim-test -- sync
-            sleep 10
+          for namespace in "${NAMESPACES[@]}"; do
+            pod_name="${POD_NAME_BY_NS[${namespace}]}"
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class mount_path min_reclaim_mib <<< "${case_def}"
+              pvc_name="${PVC_NAME_BY_KEY[${namespace}:${case_label}]}"
+              echo "===== [T3:${namespace}:${case_label}] write ${WRITE_MIB}MiB to ${pvc_name} ====="
+              write_volume_file "${namespace}" "${pod_name}" "${mount_path}" "${WRITE_MIB}"
+            done
+            kubectl exec "${pod_name}" -n "${namespace}" -- sync
+          done
+          sleep 15
 
-            local vol_name
-            vol_name=$(kubectl get pvc "${pvc_name}" -n luks-trim-test -o jsonpath='{.spec.volumeName}')
-            local size_after_write
-            size_after_write=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
-            local write_floor=$(( write_mib * 1024 * 1024 * 70 / 100 ))
-            if [[ "${size_after_write}" -lt "${write_floor}" ]]; then
-              echo "[FAIL] ${case_label}: actualSize ${size_after_write} below floor ${write_floor} after write"
-              return 1
-            fi
-
-            kubectl exec "${pod_name}" -n luks-trim-test -- rm /data/t3-file.bin
-            kubectl exec "${pod_name}" -n luks-trim-test -- sync
-            sleep 10
-
-            local pre_trim
-            pre_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
-
-            if [[ "${run_luks_trim}" == "true" ]]; then
-              run_luks_trim_and_assert_worker "${case_label}"
-              if [[ "${case_label}" == "plain" ]]; then
-                if echo "$LAST_WORKER_LOGS" | grep -q "running fstrim"; then
-                  echo "[FAIL] ${case_label}: worker attempted direct fstrim on Longhorn volume"
-                  echo "$LAST_WORKER_LOGS"
-                  return 1
-                fi
-                if ! echo "$LAST_WORKER_LOGS" | grep -q "not LUKS-encrypted"; then
-                  echo "[FAIL] ${case_label}: worker did not report non-LUKS Longhorn handling"
-                  echo "$LAST_WORKER_LOGS"
-                  return 1
-                fi
+          for namespace in "${NAMESPACES[@]}"; do
+            pod_name="${POD_NAME_BY_NS[${namespace}]}"
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class _mount_path _min_reclaim_mib <<< "${case_def}"
+              pvc_name="${PVC_NAME_BY_KEY[${namespace}:${case_label}]}"
+              vol_name=$(kubectl get pvc "${pvc_name}" -n "${namespace}" -o jsonpath='{.spec.volumeName}')
+              size_after_write=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+              write_floor=$(( WRITE_MIB * 1024 * 1024 * 70 / 100 ))
+              if [[ "${size_after_write}" -lt "${write_floor}" ]]; then
+                echo "[FAIL] ${namespace}/${case_label}: actualSize ${size_after_write} below floor ${write_floor} after write"
+                exit 1
               fi
-            else
-              echo "[INFO] ${case_label}: skipping luks-trim worker (no-encryption class)"
-            fi
+              VOL_NAME_BY_KEY["${namespace}:${case_label}"]="${vol_name}"
+            done
+          done
 
-            trigger_longhorn_trim_job "${case_label}"
-            sleep 20
+          for namespace in "${NAMESPACES[@]}"; do
+            pod_name="${POD_NAME_BY_NS[${namespace}]}"
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class mount_path _min_reclaim_mib <<< "${case_def}"
+              delete_volume_file "${namespace}" "${pod_name}" "${mount_path}"
+            done
+            kubectl exec "${pod_name}" -n "${namespace}" -- sync
+          done
+          sleep 15
 
-            local post_trim
-            post_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
-            local reclaimed=$(( pre_trim - post_trim ))
-            local min_reclaim_bytes=$(( min_reclaim_mib * 1024 * 1024 ))
-            local pre_trim_mib=$(( pre_trim / 1024 / 1024 ))
-            local post_trim_mib=$(( post_trim / 1024 / 1024 ))
-            local reclaimed_mib=$(( reclaimed / 1024 / 1024 ))
+          for namespace in "${NAMESPACES[@]}"; do
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class _mount_path _min_reclaim_mib <<< "${case_def}"
+              vol_name="${VOL_NAME_BY_KEY[${namespace}:${case_label}]}"
+              PRE_TRIM_BY_KEY["${namespace}:${case_label}"]=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+            done
+          done
 
-            echo "[INFO] ${case_label}: before=${pre_trim_mib}MiB (${pre_trim} bytes), after=${post_trim_mib}MiB (${post_trim} bytes), reclaimed=${reclaimed_mib}MiB (${reclaimed} bytes)"
+          LAST_WORKER_LOGS=""
+          LAST_WORKER_JOB=""
+          run_luks_trim_and_assert_worker "t3-multi-ns"
 
-            if [[ "${min_reclaim_mib}" -gt 0 ]]; then
+          if echo "$LAST_WORKER_LOGS" | grep -q "running fstrim"; then
+            echo "[FAIL] worker attempted direct fstrim on Longhorn volume"
+            echo "$LAST_WORKER_LOGS"
+            exit 1
+          fi
+          if ! echo "$LAST_WORKER_LOGS" | grep -q "not LUKS-encrypted"; then
+            echo "[FAIL] worker did not report non-LUKS Longhorn handling"
+            echo "$LAST_WORKER_LOGS"
+            exit 1
+          fi
+
+          trigger_longhorn_trim_job "t3-multi-ns"
+          sleep 30
+
+          for namespace in "${NAMESPACES[@]}"; do
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class _mount_path min_reclaim_mib <<< "${case_def}"
+              vol_name="${VOL_NAME_BY_KEY[${namespace}:${case_label}]}"
+              pre_trim="${PRE_TRIM_BY_KEY[${namespace}:${case_label}]}"
+              post_trim=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
+              reclaimed=$(( pre_trim - post_trim ))
+              min_reclaim_bytes=$(( min_reclaim_mib * 1024 * 1024 ))
+              pre_trim_mib=$(( pre_trim / 1024 / 1024 ))
+              post_trim_mib=$(( post_trim / 1024 / 1024 ))
+              reclaimed_mib=$(( reclaimed / 1024 / 1024 ))
+
+              echo "[INFO] ${namespace}/${case_label}: before=${pre_trim_mib}MiB (${pre_trim} bytes), after=${post_trim_mib}MiB (${post_trim} bytes), reclaimed=${reclaimed_mib}MiB (${reclaimed} bytes)"
+
               if [[ "${reclaimed}" -lt "${min_reclaim_bytes}" ]]; then
-                if [[ "${run_luks_trim}" == "true" ]] && echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
-                  echo "[WARN] ${case_label}: reclaimed ${reclaimed} bytes but worker ${LAST_WORKER_JOB} reported allow_discards already active"
+                if echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
+                  echo "[WARN] ${namespace}/${case_label}: reclaimed ${reclaimed} bytes but worker ${LAST_WORKER_JOB} reported allow_discards already active"
                 else
-                  echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
-                  return 1
+                  echo "[FAIL] ${namespace}/${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
+                  exit 1
                 fi
               fi
-            else
-              if [[ "${post_trim}" -gt "${pre_trim}" ]]; then
-                echo "[FAIL] ${case_label}: post-trim size grew (${post_trim} > ${pre_trim})"
-                return 1
-              fi
-            fi
+            done
+          done
 
-            kubectl delete pod "${pod_name}" -n luks-trim-test --ignore-not-found=true
-            kubectl delete pvc "${pvc_name}" -n luks-trim-test --ignore-not-found=true
-            kubectl wait --for=delete pod/"${pod_name}" -n luks-trim-test --timeout=3m || true
-            kubectl wait --for=delete pvc/"${pvc_name}" -n luks-trim-test --timeout=3m || true
+          for namespace in "${NAMESPACES[@]}"; do
+            pod_name="${POD_NAME_BY_NS[${namespace}]}"
+            kubectl delete pod "${pod_name}" -n "${namespace}" --ignore-not-found=true
+            for case_def in "${CASES[@]}"; do
+              IFS=':' read -r case_label _storage_class _mount_path _min_reclaim_mib <<< "${case_def}"
+              pvc_name="${PVC_NAME_BY_KEY[${namespace}:${case_label}]}"
+              kubectl delete pvc "${pvc_name}" -n "${namespace}" --ignore-not-found=true
+            done
+            kubectl wait --for=delete pod/"${pod_name}" -n "${namespace}" --timeout=3m || true
+          done
 
-            echo "[PASS] ${case_label}: T1-style reclaim flow passed"
-          }
-
-          run_case "ns" "luks-ns-key" "t3-ns-vol" "t3-ns-filler" 512 400 true
-          run_case "pvc" "luks-pvc-key" "t3-pvc-vol" "t3-pvc-filler" 512 400 true
-          run_case "plain" "no-encryption" "t3-plain-vol" "t3-plain-filler" 512 400 true
+          echo "[PASS] T3 single-execution multi-namespace reclaim flow passed"
 
       # ======================================================================
       # T4 — TALOS ENCRYPTED USERVOLUME AS LONGHORN DISK PATH
