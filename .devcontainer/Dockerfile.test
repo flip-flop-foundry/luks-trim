@@ -49,6 +49,6 @@ https://download.docker.com/linux/ubuntu noble stable" \
     apt-get install -y --no-install-recommends docker-ce-cli && \
     rm -rf /var/lib/apt/lists/*
 
-# ─── post-create.sh (installs talosctl + yamllint, verifies all tools) ───────
+# ─── post-create.sh (installs talosctl + shell tooling + yamllint) ───────────
 COPY post-create.sh /tmp/post-create.sh
 RUN bash /tmp/post-create.sh
