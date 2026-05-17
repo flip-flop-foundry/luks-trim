@@ -1785,7 +1785,11 @@ jobs:
           declare -A PRE_TRIM_BY_KEY
 
           for namespace in "${NAMESPACES[@]}"; do
-            suffix=$(echo "${namespace}" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+            if [[ "${namespace}" == "luks-trim-test" ]]; then
+              suffix="main"
+            else
+              suffix="alt"
+            fi
             pod_name="t3-${suffix}-filler"
             ns_pvc="t3-${suffix}-ns-vol"
             pvc_pvc="t3-${suffix}-pvc-vol"
@@ -1869,6 +1873,9 @@ jobs:
           done
 
           for namespace in "${NAMESPACES[@]}"; do
+            # One pod now mounts three PVCs. CSI attach/mount can serialize per
+            # volume on a single node, so readiness can take materially longer
+            # than the prior single-PVC pod setup.
             kubectl wait pod/"${POD_NAME_BY_NS[${namespace}]}" -n "${namespace}" --for=condition=Ready --timeout=8m
           done
 
@@ -1928,7 +1935,7 @@ jobs:
             exit 1
           fi
           if ! echo "$LAST_WORKER_LOGS" | grep -q "not LUKS-encrypted"; then
-            echo "[FAIL] worker did not report non-LUKS Longhorn handling"
+            echo "[FAIL] worker did not report non-LUKS Longhorn handling for plain volumes"
             echo "$LAST_WORKER_LOGS"
             exit 1
           fi
