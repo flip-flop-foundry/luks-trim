@@ -8,6 +8,10 @@
 #   GLOBAL_KEY_NS              namespace of the global key secret
 #   GLOBAL_KEY_SECRET          name of the global key secret
 #   GLOBAL_KEY_FIELD           data field name inside the secret
+#   PV_ANNOTATIONS_ENABLED     "true" | "false"
+#   PV_ANNOTATIONS_KEY_PREFIX  annotation key prefix (default: luks-trim)
+#   PV_ANNOTATIONS_INCLUDE_FAILURE_REASON  "true" | "false"
+#   PV_ANNOTATIONS_INCLUDE_NODE_NAME       "true" | "false"
 #   DRY_RUN                    "true" | "false" — skip all writes when true
 #   TALOS_STATIC_KEY_ENABLED   "true" | "false"
 #   TALOS_STATIC_KEY_NS        namespace of the static key secret
@@ -35,6 +39,9 @@ printf '%s\n' \
 KUBE_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 KUBE_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 KUBE_API=https://kubernetes.default.svc
+RUN_EPOCH=$(date +%s)
+RUN_TS_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+WORKER_NODE=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
 
 # ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -88,6 +95,97 @@ fetch_secret_key() {
     403) log_warn "secret $_namespace/$_secret_name: permission denied" ;;
     '')  log_warn "secret $_namespace/$_secret_name: no response from API" ;;
     *)   log_warn "secret $_namespace/$_secret_name: HTTP $_http_code" ;;
+  esac
+}
+
+# kube_patch_with_status </api/path> <json-merge-patch>
+# Prints only the HTTP status code.
+kube_patch_with_status() {
+  _api_path="$1"
+  _json_patch="$2"
+  curl -s -o /dev/null -w "%{http_code}" --cacert "$KUBE_CA" \
+    -X PATCH \
+    -H "Authorization: Bearer $KUBE_TOKEN" \
+    -H "Content-Type: application/merge-patch+json" \
+    --data "$_json_patch" \
+    "$KUBE_API$_api_path" 2>/dev/null
+}
+
+# annotate_longhorn_pv <pv-name> <status> <reason> <encrypted> <discard-before>
+#                      <discard-after> <key-identified> <key-source> <would-apply>
+annotate_longhorn_pv() {
+  _pv_name="$1"
+  _status="$2"
+  _reason="$3"
+  _encrypted="$4"
+  _discard_before="$5"
+  _discard_after="$6"
+  _key_identified="$7"
+  _key_source="$8"
+  _would_apply="$9"
+
+  if ! is_true "${PV_ANNOTATIONS_ENABLED:-false}"; then
+    return 0
+  fi
+
+  _key_prefix="${PV_ANNOTATIONS_KEY_PREFIX:-luks-trim}"
+  _key_prefix=$(printf '%s' "$_key_prefix" | sed 's:/*$::')
+  [ -z "$_key_prefix" ] && _key_prefix="luks-trim"
+
+  _mode="live"
+  is_true "${DRY_RUN:-false}" && _mode="dry-run"
+
+  _result_json=$(jq -cn \
+    --arg status "$_status" \
+    --arg mode "$_mode" \
+    --arg pv "$_pv_name" \
+    --arg epoch "$RUN_EPOCH" \
+    --arg ts "$RUN_TS_UTC" \
+    --arg encrypted "$_encrypted" \
+    --arg discard_before "$_discard_before" \
+    --arg discard_after "$_discard_after" \
+    --arg key_identified "$_key_identified" \
+    --arg key_source "$_key_source" \
+    --arg reason "$_reason" \
+    --arg include_reason "${PV_ANNOTATIONS_INCLUDE_FAILURE_REASON:-true}" \
+    --arg include_node "${PV_ANNOTATIONS_INCLUDE_NODE_NAME:-true}" \
+    --arg node "$WORKER_NODE" \
+    --arg would_apply "$_would_apply" \
+    '{
+      schema: "v1",
+      component: "longhorn",
+      status: $status,
+      mode: $mode,
+      pv: $pv,
+      runEpoch: ($epoch | tonumber),
+      runTime: $ts,
+      encrypted: ($encrypted == "true"),
+      allowDiscardsBefore: ($discard_before == "true"),
+      allowDiscardsAfter: ($discard_after == "true"),
+      keyIdentified: ($key_identified == "true"),
+      keySource: (if $key_source == "" then null else $key_source end),
+      fstrimOwner: "longhorn-recurring-job",
+      wouldApplyAllowDiscards: ($would_apply == "true")
+    }
+    + (if $include_reason == "true" and $reason != "" then {reason: $reason} else {} end)
+    + (if $include_node == "true" and $node != "" then {workerNode: $node} else {} end)')
+
+  _patch_payload=$(jq -cn \
+    --arg status_key "$_key_prefix/status" \
+    --arg lastrun_key "$_key_prefix/lastrun" \
+    --arg result_key "$_key_prefix/last-result" \
+    --arg status_val "$_status" \
+    --arg lastrun_val "$RUN_EPOCH" \
+    --arg result_val "$_result_json" \
+    '{metadata: {annotations: {($status_key): $status_val, ($lastrun_key): $lastrun_val, ($result_key): $result_val}}}')
+
+  _http_code=$(kube_patch_with_status "/api/v1/persistentvolumes/$_pv_name" "$_patch_payload")
+  case "$_http_code" in
+    200|201) log_info "annotated PV $_pv_name (status=$_status)" ;;
+    404) log_warn "PV $_pv_name not found for annotation" ;;
+    403) log_warn "PV $_pv_name annotation denied (missing patch permission?)" ;;
+    '')  log_warn "PV $_pv_name annotation: no response from API" ;;
+    *)   log_warn "PV $_pv_name annotation failed (HTTP $_http_code)" ;;
   esac
 }
 
@@ -256,11 +354,20 @@ process_longhorn_volumes() {
     # TRIM remains Longhorn RecurringJob responsibility.
     if ! cryptsetup isLuks "$_device" >/dev/null 2>&1; then
       echo "  $_volume_name: not LUKS-encrypted — skipping (trim handled by Longhorn RecurringJob)"
+      annotate_longhorn_pv "$_volume_name" "skipped" "not LUKS-encrypted; trim handled by Longhorn RecurringJob" "false" "false" "false" "false" "" "false"
       continue
     fi
 
+    _discard_before="false"
+    _discard_after="false"
+    _key_identified="false"
+    _would_apply="false"
+
     if has_allow_discards_active "$_volume_name"; then
+      _discard_before="true"
+      _discard_after="true"
       echo "  $_volume_name: allow_discards already active, skipping"
+      annotate_longhorn_pv "$_volume_name" "skipped" "allow_discards already active" "true" "$_discard_before" "$_discard_after" "$_key_identified" "" "$_would_apply"
       continue
     fi
 
@@ -308,13 +415,19 @@ process_longhorn_volumes() {
     {{- end }}
 
     if [ -n "$_applied_key_label" ]; then
+      _key_identified="true"
       if is_true "${DRY_RUN:-false}"; then
+        _would_apply="true"
         echo "  $_volume_name: [dry-run] key valid — allow-discards would be applied (key: $_applied_key_label)"
+        annotate_longhorn_pv "$_volume_name" "success" "key validated in dry-run; allow_discards would be applied" "true" "$_discard_before" "$_discard_after" "$_key_identified" "$_applied_key_label" "$_would_apply"
       else
+        _discard_after="true"
         echo "  $_volume_name: allow-discards enabled (key: $_applied_key_label)"
+        annotate_longhorn_pv "$_volume_name" "success" "allow_discards enabled" "true" "$_discard_before" "$_discard_after" "$_key_identified" "$_applied_key_label" "$_would_apply"
       fi
     else
       echo "  [ERROR] $_volume_name: no matching key found — allow-discards NOT enabled"
+      annotate_longhorn_pv "$_volume_name" "failure" "no matching key found; allow_discards not enabled" "true" "$_discard_before" "$_discard_after" "$_key_identified" "" "$_would_apply"
       _failed_count=$(( _failed_count + 1 ))
     fi
   done

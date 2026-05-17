@@ -63,6 +63,14 @@ spec:
                   value: {{ .Values.longhorn.globalKey.secretKey | quote }}
                 - name: LONGHORN_DEVICE_PATH
                   value: {{ .Values.longhorn.devicePath | quote }}
+                - name: PV_ANNOTATIONS_ENABLED
+                  value: {{ (and .Values.longhorn.enabled .Values.pvAnnotations.enabled) | toString | quote }}
+                - name: PV_ANNOTATIONS_KEY_PREFIX
+                  value: {{ .Values.pvAnnotations.keyPrefix | quote }}
+                - name: PV_ANNOTATIONS_INCLUDE_FAILURE_REASON
+                  value: {{ .Values.pvAnnotations.includeFailureReason | toString | quote }}
+                - name: PV_ANNOTATIONS_INCLUDE_NODE_NAME
+                  value: {{ .Values.pvAnnotations.includeNodeName | toString | quote }}
                 - name: TALOS_STATIC_KEY_ENABLED
                   value: {{ (and .Values.talos.enabled .Values.talos.staticKey.enabled) | toString | quote }}
                 - name: TALOS_STATIC_KEY_NS

@@ -26,6 +26,9 @@
 #     confirm replica placement on the uservolume, then run T1-style reclaim
 #     with both luks-trim (talos + longhorn paths) and Longhorn trim trigger.
 #
+# T5  Negative path — intentionally misconfigure worker key lookup and verify
+#     worker failure and PV annotations report status=failure with JSON detail.
+#
 # Trigger: workflow_dispatch only (not automated; QEMU cluster takes ~30 min).
 # To gate PRs, add a `pull_request` trigger once the cluster setup time is
 # acceptable for your CI budget.
@@ -846,6 +849,8 @@ jobs:
             --set image.repository="${REPO}" \
             --set image.tag="${TAG}" \
             --set longhorn.enabled=true \
+            --set pvAnnotations.enabled=true \
+            --set pvAnnotations.keyPrefix=luks-trim \
             --set longhorn.globalKey.enabled=true \
             --set longhorn.globalKey.secretName=longhorn-crypto \
             --set longhorn.globalKey.secretNamespace=longhorn-system \
@@ -1020,6 +1025,64 @@ jobs:
           fi
 
           echo "[PASS] T0: [dry-run] lines present and no errors on fresh volume"
+
+      - name: "[T0] Assert PV annotations from dry-run run"
+        run: |
+          PV_NAME="${{ steps.t0-before.outputs.vol_name }}"
+          if [[ -z "${PV_NAME}" ]]; then
+            echo "::error::T0 PV name is empty"
+            exit 1
+          fi
+
+          PV_JSON=$(kubectl get pv "${PV_NAME}" -o json)
+          STATUS=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          RESULT=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          if [[ "${STATUS}" != "success" ]]; then
+            echo "::error::Expected luks-trim/status=success for ${PV_NAME}, got '${STATUS}'"
+            exit 1
+          fi
+
+          if ! [[ "${LASTRUN}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Expected numeric luks-trim/lastrun for ${PV_NAME}, got '${LASTRUN}'"
+            exit 1
+          fi
+
+          if [[ -z "${RESULT}" ]]; then
+            echo "::error::Missing luks-trim/last-result on ${PV_NAME}"
+            exit 1
+          fi
+          echo "${RESULT}" | jq -e . >/dev/null
+
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_COMPONENT=$(echo "${RESULT}" | jq -r '.component // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+          RESULT_REASON=$(echo "${RESULT}" | jq -r '.reason // empty')
+
+          [[ "${RESULT_STATUS}" == "${STATUS}" ]] || {
+            echo "::error::JSON status '${RESULT_STATUS}' does not match flat status '${STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_MODE}" == "dry-run" ]] || {
+            echo "::error::Expected JSON mode dry-run, got '${RESULT_MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_COMPONENT}" == "longhorn" ]] || {
+            echo "::error::Expected JSON component longhorn, got '${RESULT_COMPONENT}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::Expected runEpoch=${LASTRUN}, got ${RESULT_RUN_EPOCH}"
+            exit 1
+          }
+          [[ -n "${RESULT_REASON}" ]] || {
+            echo "::error::Expected non-empty reason in last-result"
+            exit 1
+          }
+
+          echo "[PASS] T0 PV annotations validated on ${PV_NAME}"
 
       - name: "[T0] Assert actualSize unchanged after dry-run"
         run: |
@@ -1345,6 +1408,58 @@ jobs:
 
           echo "[PASS] Worker pod exited 0; no error lines found"
 
+      - name: "[T1] Assert PV annotations from live run"
+        run: |
+          PV_NAME="${{ steps.baseline.outputs.vol_name }}"
+          PV_JSON=$(kubectl get pv "${PV_NAME}" -o json)
+
+          STATUS=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          RESULT=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          [[ "${STATUS}" == "success" ]] || {
+            echo "::error::Expected luks-trim/status=success for ${PV_NAME}, got '${STATUS}'"
+            exit 1
+          }
+          [[ "${LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::Expected numeric lastrun for ${PV_NAME}, got '${LASTRUN}'"
+            exit 1
+          }
+          [[ -n "${RESULT}" ]] || {
+            echo "::error::Missing last-result annotation for ${PV_NAME}"
+            exit 1
+          }
+
+          echo "${RESULT}" | jq -e . >/dev/null
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+          RESULT_ENCRYPTED=$(echo "${RESULT}" | jq -r '.encrypted // empty')
+          RESULT_KEY_IDENTIFIED=$(echo "${RESULT}" | jq -r '.keyIdentified // empty')
+
+          [[ "${RESULT_STATUS}" == "success" ]] || {
+            echo "::error::Expected JSON status success, got '${RESULT_STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_MODE}" == "live" ]] || {
+            echo "::error::Expected JSON mode live, got '${RESULT_MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::Expected runEpoch=${LASTRUN}, got ${RESULT_RUN_EPOCH}"
+            exit 1
+          }
+          [[ "${RESULT_ENCRYPTED}" == "true" ]] || {
+            echo "::error::Expected encrypted=true, got '${RESULT_ENCRYPTED}'"
+            exit 1
+          }
+          [[ "${RESULT_KEY_IDENTIFIED}" == "true" ]] || {
+            echo "::error::Expected keyIdentified=true, got '${RESULT_KEY_IDENTIFIED}'"
+            exit 1
+          }
+
+          echo "[PASS] T1 PV annotations validated on ${PV_NAME}"
+
       - name: "[T1] Trigger Longhorn filesystem-trim CronJob"
         run: |
           CRONJOB_NAME="ci-filesystem-trim"
@@ -1613,6 +1728,51 @@ jobs:
 
           echo "[PASS] Dry-run assertions passed"
 
+      - name: "[T2] Assert PV annotations updated by dry-run"
+        run: |
+          PV_NAME="${{ steps.baseline.outputs.vol_name }}"
+          PV_JSON=$(kubectl get pv "${PV_NAME}" -o json)
+
+          STATUS=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          RESULT=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          case "${STATUS}" in
+            success|skipped) ;;
+            *)
+              echo "::error::Expected status success|skipped after T2 dry-run, got '${STATUS}'"
+              exit 1
+              ;;
+          esac
+
+          [[ "${LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::Expected numeric lastrun for ${PV_NAME}, got '${LASTRUN}'"
+            exit 1
+          }
+          [[ -n "${RESULT}" ]] || {
+            echo "::error::Missing last-result annotation for ${PV_NAME}"
+            exit 1
+          }
+
+          echo "${RESULT}" | jq -e . >/dev/null
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+
+          [[ "${RESULT_MODE}" == "dry-run" ]] || {
+            echo "::error::Expected JSON mode dry-run, got '${RESULT_MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_STATUS}" == "${STATUS}" ]] || {
+            echo "::error::JSON status '${RESULT_STATUS}' does not match flat status '${STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::Expected runEpoch=${LASTRUN}, got ${RESULT_RUN_EPOCH}"
+            exit 1
+          }
+          echo "[PASS] T2 PV annotations validated on ${PV_NAME}"
+
       - name: "[T2] Assert actualSize unchanged during dry run"
         run: |
           VOL_NAME="${{ steps.baseline.outputs.vol_name }}"
@@ -1663,6 +1823,63 @@ jobs:
         run: |
           LAST_WORKER_LOGS=""
           LAST_WORKER_JOB=""
+
+          assert_pv_annotations() {
+            local case_label="$1"
+            local pv_name="$2"
+            local expected_status="$3"
+            local expected_mode="$4"
+            local expected_encrypted="$5"
+
+            local pv_json status lastrun result result_status result_mode
+            local result_run_epoch result_encrypted
+
+            pv_json=$(kubectl get pv "${pv_name}" -o json)
+            status=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+            lastrun=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+            result=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+            [[ "${status}" == "${expected_status}" ]] || {
+              echo "::error::${case_label}: expected status=${expected_status}, got '${status}'"
+              return 1
+            }
+            [[ "${lastrun}" =~ ^[0-9]+$ ]] || {
+              echo "::error::${case_label}: expected numeric lastrun, got '${lastrun}'"
+              return 1
+            }
+            [[ -n "${result}" ]] || {
+              echo "::error::${case_label}: missing last-result annotation"
+              return 1
+            }
+
+            echo "${result}" | jq -e . >/dev/null || {
+              echo "::error::${case_label}: last-result annotation is not valid JSON"
+              return 1
+            }
+
+            result_status=$(echo "${result}" | jq -r '.status // empty')
+            result_mode=$(echo "${result}" | jq -r '.mode // empty')
+            result_run_epoch=$(echo "${result}" | jq -r '.runEpoch // empty')
+            result_encrypted=$(echo "${result}" | jq -r '.encrypted // empty')
+
+            [[ "${result_status}" == "${status}" ]] || {
+              echo "::error::${case_label}: JSON status '${result_status}' != flat status '${status}'"
+              return 1
+            }
+            [[ "${result_mode}" == "${expected_mode}" ]] || {
+              echo "::error::${case_label}: expected mode=${expected_mode}, got '${result_mode}'"
+              return 1
+            }
+            [[ "${result_run_epoch}" == "${lastrun}" ]] || {
+              echo "::error::${case_label}: runEpoch '${result_run_epoch}' != lastrun '${lastrun}'"
+              return 1
+            }
+            [[ "${result_encrypted}" == "${expected_encrypted}" ]] || {
+              echo "::error::${case_label}: expected encrypted=${expected_encrypted}, got '${result_encrypted}'"
+              return 1
+            }
+            echo "[PASS] ${case_label}: PV annotations validated (${pv_name})"
+          }
 
           trigger_longhorn_trim_job() {
             local case_label="$1"
@@ -1819,6 +2036,13 @@ jobs:
 
             if [[ "${run_luks_trim}" == "true" ]]; then
               run_luks_trim_and_assert_worker "${case_label}"
+
+              if [[ "${case_label}" == "plain" ]]; then
+                assert_pv_annotations "${case_label}" "${vol_name}" "skipped" "live" "false"
+              else
+                assert_pv_annotations "${case_label}" "${vol_name}" "success" "live" "true"
+              fi
+
               if [[ "${case_label}" == "plain" ]]; then
                 if echo "$LAST_WORKER_LOGS" | grep -q "running fstrim"; then
                   echo "::error::${case_label}: worker attempted direct fstrim on Longhorn volume"
@@ -2018,6 +2242,62 @@ jobs:
 
       - name: "[T4] Run T1-style reclaim flow on Talos uservolume-backed Longhorn volume"
         run: |
+          assert_pv_annotations() {
+            local pv_name="$1"
+            local expected_status="$2"
+            local expected_mode="$3"
+            local expected_encrypted="$4"
+
+            local pv_json status lastrun result result_status result_mode
+            local result_run_epoch result_encrypted
+
+            pv_json=$(kubectl get pv "${pv_name}" -o json)
+            status=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+            lastrun=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+            result=$(echo "${pv_json}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+            [[ "${status}" == "${expected_status}" ]] || {
+              echo "::error::T4: expected status=${expected_status}, got '${status}'"
+              return 1
+            }
+            [[ "${lastrun}" =~ ^[0-9]+$ ]] || {
+              echo "::error::T4: expected numeric lastrun, got '${lastrun}'"
+              return 1
+            }
+            [[ -n "${result}" ]] || {
+              echo "::error::T4: missing last-result annotation"
+              return 1
+            }
+
+            echo "${result}" | jq -e . >/dev/null || {
+              echo "::error::T4: last-result annotation is not valid JSON"
+              return 1
+            }
+
+            result_status=$(echo "${result}" | jq -r '.status // empty')
+            result_mode=$(echo "${result}" | jq -r '.mode // empty')
+            result_run_epoch=$(echo "${result}" | jq -r '.runEpoch // empty')
+            result_encrypted=$(echo "${result}" | jq -r '.encrypted // empty')
+
+            [[ "${result_status}" == "${status}" ]] || {
+              echo "::error::T4: JSON status '${result_status}' != flat status '${status}'"
+              return 1
+            }
+            [[ "${result_mode}" == "${expected_mode}" ]] || {
+              echo "::error::T4: expected mode=${expected_mode}, got '${result_mode}'"
+              return 1
+            }
+            [[ "${result_run_epoch}" == "${lastrun}" ]] || {
+              echo "::error::T4: runEpoch '${result_run_epoch}' != lastrun '${lastrun}'"
+              return 1
+            }
+            [[ "${result_encrypted}" == "${expected_encrypted}" ]] || {
+              echo "::error::T4: expected encrypted=${expected_encrypted}, got '${result_encrypted}'"
+              return 1
+            }
+            echo "[PASS] T4 PV annotations validated (${pv_name})"
+          }
+
           run_luks_trim_and_assert_worker() {
             local case_label="$1"
             local coord_job="luks-trim-${case_label}-$(date +%s)"
@@ -2206,6 +2486,7 @@ jobs:
           PRE_TRIM=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
 
           run_luks_trim_and_assert_worker "t4-talos-uservol"
+          assert_pv_annotations "${VOL_NAME}" "skipped" "live" "false"
           trigger_longhorn_trim_job "t4-talos-uservol"
 
           sleep 20
@@ -2223,6 +2504,191 @@ jobs:
           kubectl delete pvc t4-talos-uservol-vol -n luks-trim-test --ignore-not-found=true
           kubectl wait --for=delete pod/t4-talos-uservol-filler -n luks-trim-test --timeout=3m || true
           kubectl wait --for=delete pvc/t4-talos-uservol-vol -n luks-trim-test --timeout=3m || true
+
+      # ======================================================================
+      # T5 — NEGATIVE PATH: WRONG KEY CONFIGURATION
+      #
+      # 1. Intentionally point worker global key lookup at a non-existent secret.
+      # 2. Create an encrypted volume in a namespace not present in
+      #    longhorn.namespaceSecrets so no namespace fallback key is available.
+      # 3. Run luks-trim and assert worker failure.
+      # 4. Assert PV annotations report status=failure with JSON details.
+      # ======================================================================
+
+      - name: "[T5] Prepare misconfiguration and isolated encrypted PVC"
+        id: t5-prepare
+        run: |
+          kubectl create namespace luks-trim-neg --dry-run=client -o yaml | kubectl apply -f -
+
+          helm upgrade luks-trim . \
+            --namespace   luks-trim \
+            --reuse-values \
+            --set talos.enabled=false \
+            --set longhorn.globalKey.secretName=missing-global-key
+
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: t5-neg-vol
+            namespace: luks-trim-neg
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: luks-global-key
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: t5-neg-filler
+            namespace: luks-trim-neg
+          spec:
+            containers:
+              - name: filler
+                image: ubuntu:24.04
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: t5-neg-vol
+            restartPolicy: Never
+          EOF
+
+          if ! kubectl wait pod/t5-neg-filler -n luks-trim-neg --for=condition=Ready --timeout=5m; then
+            echo "::error::t5-neg-filler did not become Ready"
+            kubectl get pod t5-neg-filler -n luks-trim-neg -o wide || true
+            kubectl describe pod t5-neg-filler -n luks-trim-neg || true
+            kubectl get pvc t5-neg-vol -n luks-trim-neg -o wide || true
+            kubectl describe pvc t5-neg-vol -n luks-trim-neg || true
+            exit 1
+          fi
+
+          PV_NAME=$(kubectl get pvc t5-neg-vol -n luks-trim-neg -o jsonpath='{.spec.volumeName}')
+          if [[ -z "${PV_NAME}" ]]; then
+            echo "::error::Could not resolve PV name for t5-neg-vol"
+            exit 1
+          fi
+          echo "pv_name=${PV_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: "[T5] Assert worker failure and PV failure annotations"
+        run: |
+          TS=$(date +%s)
+          COORD_JOB="luks-trim-t5-neg-${TS}"
+
+          PREV_JOBS=$(kubectl get jobs -n luks-trim \
+            -l "luks-trim/role=worker" -o name 2>/dev/null | sort)
+
+          kubectl create job "${COORD_JOB}" --from=cronjob/luks-trim -n luks-trim
+
+          if ! kubectl wait -n luks-trim --for=condition=complete "job/${COORD_JOB}" --timeout=5m; then
+            echo "::error::T5 coordinator ${COORD_JOB} did not complete"
+            kubectl get "job/${COORD_JOB}" -n luks-trim -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${COORD_JOB}" --tail=-1 || true
+            exit 1
+          fi
+
+          DEADLINE=$(( SECONDS + 60 ))
+          WORKER_JOB=""
+          until [[ $SECONDS -ge $DEADLINE ]]; do
+            for NEW_JOB in $(kubectl get jobs -n luks-trim \
+              -l "luks-trim/role=worker" \
+              --sort-by='.metadata.creationTimestamp' \
+              -o name 2>/dev/null | sed 's|job.batch/||'); do
+              if ! echo "$PREV_JOBS" | grep -qF "job.batch/${NEW_JOB}"; then
+                WORKER_JOB="$NEW_JOB"
+              fi
+            done
+            [[ -n "$WORKER_JOB" ]] && break
+            sleep 3
+          done
+
+          if [[ -z "$WORKER_JOB" ]]; then
+            echo "::error::No worker job found for T5"
+            kubectl get jobs -n luks-trim -l "luks-trim/role=worker" -o wide || true
+            exit 1
+          fi
+
+          if ! kubectl wait -n luks-trim --for=condition=failed "job/${WORKER_JOB}" --timeout=5m; then
+            echo "::error::Expected worker ${WORKER_JOB} to fail in T5"
+            kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
+            kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
+            kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
+            exit 1
+          fi
+
+          LOGS=$(kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null)
+          ERROR_COUNT=$(echo "$LOGS" | grep -c '\[ERROR\]' || true)
+          if [[ "$ERROR_COUNT" -eq 0 ]]; then
+            echo "::error::Expected [ERROR] lines in T5 worker logs"
+            echo "$LOGS"
+            exit 1
+          fi
+
+          if ! echo "$LOGS" | grep -q "t5-neg-vol"; then
+            echo "::error::Expected T5 logs to mention t5-neg-vol"
+            echo "$LOGS"
+            exit 1
+          fi
+
+          PV_NAME="${{ steps.t5-prepare.outputs.pv_name }}"
+          PV_JSON=$(kubectl get pv "${PV_NAME}" -o json)
+
+          STATUS=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          RESULT=$(echo "${PV_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          [[ "${STATUS}" == "failure" ]] || {
+            echo "::error::Expected luks-trim/status=failure for ${PV_NAME}, got '${STATUS}'"
+            exit 1
+          }
+          [[ "${LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::Expected numeric lastrun for ${PV_NAME}, got '${LASTRUN}'"
+            exit 1
+          }
+          [[ -n "${RESULT}" ]] || {
+            echo "::error::Missing last-result annotation for ${PV_NAME}"
+            exit 1
+          }
+
+          echo "${RESULT}" | jq -e . >/dev/null
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+          RESULT_ENCRYPTED=$(echo "${RESULT}" | jq -r '.encrypted // empty')
+          RESULT_KEY_IDENTIFIED=$(echo "${RESULT}" | jq -r '.keyIdentified // empty')
+          RESULT_REASON=$(echo "${RESULT}" | jq -r '.reason // empty')
+
+          [[ "${RESULT_STATUS}" == "failure" ]] || {
+            echo "::error::Expected JSON status failure, got '${RESULT_STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_MODE}" == "live" ]] || {
+            echo "::error::Expected JSON mode live, got '${RESULT_MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::Expected runEpoch=${LASTRUN}, got ${RESULT_RUN_EPOCH}"
+            exit 1
+          }
+          [[ "${RESULT_ENCRYPTED}" == "true" ]] || {
+            echo "::error::Expected encrypted=true, got '${RESULT_ENCRYPTED}'"
+            exit 1
+          }
+          [[ "${RESULT_KEY_IDENTIFIED}" == "false" ]] || {
+            echo "::error::Expected keyIdentified=false, got '${RESULT_KEY_IDENTIFIED}'"
+            exit 1
+          }
+          [[ -n "${RESULT_REASON}" ]] || {
+            echo "::error::Expected non-empty reason in failure annotation"
+            exit 1
+          }
+
+          echo "[PASS] T5 negative assertions passed (worker failure + PV failure annotations)"
 
       # ======================================================================
       # ALWAYS: diagnostics on failure, then cluster teardown

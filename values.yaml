@@ -90,6 +90,30 @@ serviceAccount:
 dryRun: false
 
 # ---------------------------------------------------------------------------
+# Longhorn PersistentVolume status annotations (optional)
+# ---------------------------------------------------------------------------
+# When enabled, worker pods annotate Longhorn-backed PersistentVolumes with
+# the latest luks-trim outcome for quick filtering and troubleshooting.
+#
+# Flat annotations for filtering:
+#   <keyPrefix>/status  = success | failure | skipped
+#   <keyPrefix>/lastrun = unix epoch seconds
+#
+# Rich JSON payload:
+#   <keyPrefix>/last-result = compact JSON summary with mode, encryption,
+#   allow-discards state, key lookup result, node (optional), and reason
+#   (optional, non-sensitive).
+#
+# This feature is Longhorn-only and does not apply to Talos system volumes.
+pvAnnotations:
+  enabled: false
+  # Prefix used for all annotation keys. Keep this as a single key segment
+  # (no slash). Example keys become: luks-trim/status, luks-trim/lastrun.
+  keyPrefix: luks-trim
+  includeFailureReason: true
+  includeNodeName: true
+
+# ---------------------------------------------------------------------------
 # Schedule
 # ---------------------------------------------------------------------------
 # Standard cron expression for when the coordinator runs.

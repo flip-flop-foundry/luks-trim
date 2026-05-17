@@ -5,63 +5,57 @@ metadata:
   namespace: {{ include "luks-trim.namespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
-  {{- with .Values.serviceAccount.annotations }}
   annotations:
+    kubernetes.io/description: ServiceAccount used by the coordinator and per-node worker Jobs created by luks-trim.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: service-account
+    {{- with .Values.serviceAccount.annotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 ---
-# ClusterRole: read individual PersistentVolumes so the trim script can resolve
-# a Longhorn device name (= PV name) to the PVC namespace/name, which is then
-# used to look up the LUKS passphrase secret in the correct namespace.
+# ClusterRole: cluster-scoped read/patch permissions required by luks-trim.
+# - nodes/list: coordinator enumerates nodes to create one worker Job per node
+# - persistentvolumes/get: worker resolves Longhorn PV -> PVC for key lookup
+# - persistentvolumes/patch: optional, worker writes PV run-status annotations
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "luks-trim.fullname" . }}-pv-reader
+  name: {{ include "luks-trim.fullname" . }}-cluster-access
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "luks-trim.fullname" . }}-pv-reader
-  labels:
-    {{- include "luks-trim.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "luks-trim.fullname" . }}-pv-reader
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "luks-trim.serviceAccountName" . }}
-    namespace: {{ include "luks-trim.namespace" . }}
----
-# ClusterRole: list nodes so the coordinator can enumerate them to create
-# per-node Jobs. List (not get) is sufficient and minimal.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "luks-trim.fullname" . }}-node-reader
-  labels:
-    {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Cluster-scoped permissions for node enumeration and optional Longhorn PersistentVolume status annotations.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["list"]
+  {{- if .Values.longhorn.enabled }}
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+  {{- end }}
+  {{- if and .Values.longhorn.enabled .Values.pvAnnotations.enabled }}
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "luks-trim.fullname" . }}-node-reader
+  name: {{ include "luks-trim.fullname" . }}-cluster-access
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Binds the luks-trim ServiceAccount to cluster-scoped node/PV access.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "luks-trim.fullname" . }}-node-reader
+  name: {{ include "luks-trim.fullname" . }}-cluster-access
 subjects:
   - kind: ServiceAccount
     name: {{ include "luks-trim.serviceAccountName" . }}
@@ -77,6 +71,10 @@ metadata:
   namespace: {{ include "luks-trim.namespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Allows coordinator to create and inspect per-node worker Jobs in the chart namespace.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -89,6 +87,10 @@ metadata:
   namespace: {{ include "luks-trim.namespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Binds coordinator Job-management namespace Role to the luks-trim ServiceAccount.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -109,6 +111,10 @@ metadata:
   namespace: {{ include "luks-trim.globalKeyNamespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Allows worker to read the configured global Longhorn encryption key secret.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -123,6 +129,10 @@ metadata:
   namespace: {{ include "luks-trim.globalKeyNamespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Binds global Longhorn key secret-reader Role to the luks-trim ServiceAccount.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -145,6 +155,10 @@ metadata:
   namespace: {{ .namespace }}
   labels:
     {{- include "luks-trim.labels" $ | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Allows worker to read configured Longhorn key secrets in namespace {{ .namespace }}.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -161,6 +175,10 @@ metadata:
   namespace: {{ .namespace }}
   labels:
     {{- include "luks-trim.labels" $ | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Binds namespace Longhorn key secret-reader Role in {{ .namespace }} to the luks-trim ServiceAccount.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -183,6 +201,10 @@ metadata:
   namespace: {{ include "luks-trim.staticKeyNamespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Allows worker to read the Talos static passphrase secret.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -197,6 +219,10 @@ metadata:
   namespace: {{ include "luks-trim.staticKeyNamespace" . }}
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: Binds Talos static passphrase secret-reader Role to the luks-trim ServiceAccount.
+    app.kubernetes.io/part-of: luks-trim
+    app.kubernetes.io/component: rbac
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

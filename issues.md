@@ -237,25 +237,52 @@ We should not be running fstrim on longhorn volumes, this should be taken care o
 Have a look, but it looks like to me that luks-fstrim is running fstrim on longhorn volumes: configmap.yaml#L189
 
 
-# 8. Role/Bindings etc review
+# 8. Role/Bindings etc review [RESOLVED]
 
-* We have several cluster roles bound to the same service account, would it make sense to bundles these together in to one?
-* Can we add a description annotation to each of these, making it clear what they are used for and that they belong to luks-trim?
+Status (2026-05-17): resolved.
+
+Implemented:
+- Consolidated cluster-scoped access into one ClusterRole and one ClusterRoleBinding (`cluster-access`) bound to the luks-trim ServiceAccount.
+- Added `kubernetes.io/description` plus ownership/component annotations to ServiceAccount, ClusterRole, ClusterRoleBinding, Role, and RoleBinding resources so intent is clear.
+- Kept namespace-scoped secret Roles split by namespace/feature for least-privilege clarity.
+- Made PersistentVolume access conditional:
+  - `persistentvolumes/get` only when `longhorn.enabled=true`
+  - `persistentvolumes/patch` only when `longhorn.enabled=true` and `pvAnnotations.enabled=true`
 
 
-# 9. New feature - annotate PersistentVolumes
+# 9. New feature - annotate PersistentVolumes [RESOLVED]
 
-I´d like to add a new feature and a new variable to values.yaml to optionally enable it.
+Status (2026-05-17): resolved.
 
-Basically I would like to annotate PersistantVolumes which luks-trim has succeeded or failed to run on.
-I am thinking we might annotate it with a JSON but lets discuss it.
+Implemented feature (`values.yaml`):
+```yaml
+pvAnnotations:
+  enabled: false
+  keyPrefix: luks-trim
+  includeFailureReason: true
+  includeNodeName: true
+```
 
-If this feature is enabled, we likely need to modify one of the roles to give more permissions to PV?
+Behavior when enabled:
+- Worker annotates Longhorn-backed PersistentVolumes after each per-volume attempt.
+- Flat filter annotations:
+  - `<keyPrefix>/status` = `success|failure|skipped`
+  - `<keyPrefix>/lastrun` = epoch seconds
+- Rich JSON annotation:
+  - `<keyPrefix>/last-result` with status, mode (`live`/`dry-run`), timestamps,
+    encryption/discard state, key identification result/source, optional reason,
+    optional worker node, and explicit note that Longhorn fstrim is external.
+  - `fstrimExecuted` was intentionally removed from the payload because the
+    Longhorn path never executes fstrim directly in this chart and the value
+    was constant/redundant.
 
-Lets discuss what useful information that would be easy to add, lets focus on status on last run, anything needed to diagnose issues etc.
-Among other things I am thinking:
- * last fstrim run
- * luks discard enabled true/false
- * key successfully identified true/false
- * reclaimed space during last run
- * Anything else what would be easy to add, and be helpful to troubleshoot problems yet doesnt reveal sensitive information. 
+Test coverage:
+- Integration workflow validates annotation presence/content across T0/T1/T2/T3/T4.
+- Added T5 negative-path test: intentionally misconfigured key lookup must
+  produce worker failure and PV annotation `status=failure` with JSON details.
+
+Scope and safety notes:
+- Feature applies to Longhorn PV path only (Talos system volumes are not PV-backed).
+- Annotation patch failures are logged as warnings and do not fail the whole run.
+- No secret material is written to annotations.
+- Reclaimed-space metric is not included because this chart does not run Longhorn filesystem trim directly; that remains the Longhorn RecurringJob responsibility.
