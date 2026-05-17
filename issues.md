@@ -235,3 +235,27 @@ Status (2026-05-16):
 We should not be running fstrim on longhorn volumes, this should be taken care of by longhorn on recurring job
 
 Have a look, but it looks like to me that luks-fstrim is running fstrim on longhorn volumes: configmap.yaml#L189
+
+
+# 8. Role/Bindings etc review
+
+* We have several cluster roles bound to the same service account, would it make sense to bundles these together in to one?
+* Can we add a description annotation to each of these, making it clear what they are used for and that they belong to luks-trim?
+
+
+# 9. New feature - annotate PersistentVolumes
+
+I´d like to add a new feature and a new variable to values.yaml to optionally enable it.
+
+Basically I would like to annotate PersistantVolumes which luks-trim has succeeded or failed to run on.
+I am thinking we might annotate it with a JSON but lets discuss it.
+
+If this feature is enabled, we likely need to modify one of the roles to give more permissions to PV?
+
+Lets discuss what useful information that would be easy to add, lets focus on status on last run, anything needed to diagnose issues etc.
+Among other things I am thinking:
+ * last fstrim run
+ * luks discard enabled true/false
+ * key successfully identified true/false
+ * reclaimed space during last run
+ * Anything else what would be easy to add, and be helpful to troubleshoot problems yet doesnt reveal sensitive information. 
