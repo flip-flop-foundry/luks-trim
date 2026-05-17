@@ -286,3 +286,40 @@ Scope and safety notes:
 - Annotation patch failures are logged as warnings and do not fail the whole run.
 - No secret material is written to annotations.
 - Reclaimed-space metric is not included because this chart does not run Longhorn filesystem trim directly; that remains the Longhorn RecurringJob responsibility.
+
+
+# 10. New feature - annotate Nodes [RESOLVED]
+
+Status (2026-05-17): resolved.
+
+Implemented feature (`values.yaml`):
+```yaml
+nodeAnnotations:
+  enabled: false
+  keyPrefix: luks-trim
+  includePerVolumeDetails: true
+```
+
+Behavior when enabled:
+- Worker annotates its own Kubernetes Node at end-of-run.
+- Flat filter annotations:
+  - `<keyPrefix>/status` = `success|failure|skipped`
+  - `<keyPrefix>/lastrun` = epoch seconds
+  - `<keyPrefix>/mode` = `live|dry-run`
+  - `<keyPrefix>/volumes-processed` = aggregate Longhorn + Talos count
+  - `<keyPrefix>/volumes-failed` = aggregate Longhorn + Talos failure count
+- Rich JSON annotation:
+  - `<keyPrefix>/last-result` contains run metadata, aggregate counters,
+    Talos reclaimed-byte total, and optional per-volume detail arrays.
+
+RBAC and safety notes:
+- Added optional `nodes/patch` permission only when `nodeAnnotations.enabled=true`.
+- Worker receives explicit Node name from coordinator to patch the correct object.
+- Node annotation patch failures are logged as warnings and do not fail the run.
+- JSON payload excludes secrets and key identifiers.
+
+Test coverage:
+- Integration workflow enables node annotations and validates:
+  - T1 live path: node status/mode/totals are updated and JSON matches flat keys.
+  - T2 dry-run path: node mode is `dry-run` and runEpoch aligns with flat lastrun.
+  - T5 negative path: node status is `failure` and failed-volume counters are non-zero.

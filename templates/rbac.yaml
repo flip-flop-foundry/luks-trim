@@ -15,6 +15,7 @@ metadata:
 ---
 # ClusterRole: cluster-scoped read/patch permissions required by luks-trim.
 # - nodes/list: coordinator enumerates nodes to create one worker Job per node
+# - nodes/patch: optional, worker writes Node run-status annotations
 # - persistentvolumes/get: worker resolves Longhorn PV -> PVC for key lookup
 # - persistentvolumes/patch: optional, worker writes PV run-status annotations
 apiVersion: rbac.authorization.k8s.io/v1
@@ -24,13 +25,18 @@ metadata:
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
   annotations:
-    kubernetes.io/description: Cluster-scoped permissions for node enumeration and optional Longhorn PersistentVolume status annotations.
+    kubernetes.io/description: Cluster-scoped permissions for node enumeration and optional Node/PersistentVolume run-status annotations.
     app.kubernetes.io/part-of: luks-trim
     app.kubernetes.io/component: rbac
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["list"]
+  {{- if .Values.nodeAnnotations.enabled }}
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+  {{- end }}
   {{- if .Values.longhorn.enabled }}
   - apiGroups: [""]
     resources: ["persistentvolumes"]
@@ -49,7 +55,7 @@ metadata:
   labels:
     {{- include "luks-trim.labels" . | nindent 4 }}
   annotations:
-    kubernetes.io/description: Binds the luks-trim ServiceAccount to cluster-scoped node/PV access.
+    kubernetes.io/description: Binds the luks-trim ServiceAccount to cluster-scoped Node/PV access.
     app.kubernetes.io/part-of: luks-trim
     app.kubernetes.io/component: rbac
 roleRef:
@@ -63,7 +69,7 @@ subjects:
 ---
 # Role: coordinator creates one Job per node by listing/creating Jobs in the
 # chart namespace. Completed Jobs are cleaned up automatically by Kubernetes
-# TTLAfterFinished using .Values.ttlSecondsAfterFinished.
+# TTLAfterFinished using the chart TTL settings.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

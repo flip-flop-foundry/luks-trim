@@ -851,6 +851,8 @@ jobs:
             --set longhorn.enabled=true \
             --set pvAnnotations.enabled=true \
             --set pvAnnotations.keyPrefix=luks-trim \
+            --set nodeAnnotations.enabled=true \
+            --set nodeAnnotations.keyPrefix=luks-trim \
             --set longhorn.globalKey.enabled=true \
             --set longhorn.globalKey.secretName=longhorn-crypto \
             --set longhorn.globalKey.secretNamespace=longhorn-system \
@@ -1460,6 +1462,87 @@ jobs:
 
           echo "[PASS] T1 PV annotations validated on ${PV_NAME}"
 
+      - name: "[T1] Assert Node annotations from live run"
+        run: |
+          WORKER_JOB="${{ steps.live-run.outputs.worker_job }}"
+          NODE_NAME=$(kubectl get job "${WORKER_JOB}" -n luks-trim -o jsonpath='{.spec.template.spec.nodeName}')
+          if [[ -z "${NODE_NAME}" ]]; then
+            echo "::error::T1: could not resolve nodeName for worker ${WORKER_JOB}"
+            exit 1
+          fi
+
+          NODE_JSON=$(kubectl get node "${NODE_NAME}" -o json)
+          STATUS=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          MODE=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/mode"] // empty')
+          PROCESSED=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/volumes-processed"] // empty')
+          FAILED=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/volumes-failed"] // empty')
+          RESULT=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          [[ "${STATUS}" == "success" ]] || {
+            echo "::error::T1: expected node status=success, got '${STATUS}'"
+            exit 1
+          }
+          [[ "${LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T1: expected numeric node lastrun, got '${LASTRUN}'"
+            exit 1
+          }
+          [[ "${MODE}" == "live" ]] || {
+            echo "::error::T1: expected node mode=live, got '${MODE}'"
+            exit 1
+          }
+          [[ "${PROCESSED}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T1: expected numeric node volumes-processed, got '${PROCESSED}'"
+            exit 1
+          }
+          [[ "${FAILED}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T1: expected numeric node volumes-failed, got '${FAILED}'"
+            exit 1
+          }
+          [[ "${FAILED}" == "0" ]] || {
+            echo "::error::T1: expected node volumes-failed=0, got '${FAILED}'"
+            exit 1
+          }
+          [[ -n "${RESULT}" ]] || {
+            echo "::error::T1: missing node last-result annotation"
+            exit 1
+          }
+
+          echo "${RESULT}" | jq -e . >/dev/null
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+          RESULT_WORKER_NODE=$(echo "${RESULT}" | jq -r '.workerNode // empty')
+          RESULT_TOTAL_PROCESSED=$(echo "${RESULT}" | jq -r '.totals.volumesProcessed // empty')
+          RESULT_TOTAL_FAILED=$(echo "${RESULT}" | jq -r '.totals.volumesFailed // empty')
+
+          [[ "${RESULT_STATUS}" == "${STATUS}" ]] || {
+            echo "::error::T1: node JSON status '${RESULT_STATUS}' does not match flat '${STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_MODE}" == "${MODE}" ]] || {
+            echo "::error::T1: node JSON mode '${RESULT_MODE}' does not match flat '${MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::T1: node runEpoch '${RESULT_RUN_EPOCH}' does not match lastrun '${LASTRUN}'"
+            exit 1
+          }
+          [[ "${RESULT_WORKER_NODE}" == "${NODE_NAME}" ]] || {
+            echo "::error::T1: node workerNode '${RESULT_WORKER_NODE}' does not match '${NODE_NAME}'"
+            exit 1
+          }
+          [[ "${RESULT_TOTAL_PROCESSED}" == "${PROCESSED}" ]] || {
+            echo "::error::T1: node totals.volumesProcessed '${RESULT_TOTAL_PROCESSED}' does not match flat '${PROCESSED}'"
+            exit 1
+          }
+          [[ "${RESULT_TOTAL_FAILED}" == "${FAILED}" ]] || {
+            echo "::error::T1: node totals.volumesFailed '${RESULT_TOTAL_FAILED}' does not match flat '${FAILED}'"
+            exit 1
+          }
+
+          echo "[PASS] T1 node annotations validated on ${NODE_NAME}"
+
       - name: "[T1] Trigger Longhorn filesystem-trim CronJob"
         run: |
           CRONJOB_NAME="ci-filesystem-trim"
@@ -1772,6 +1855,58 @@ jobs:
             exit 1
           }
           echo "[PASS] T2 PV annotations validated on ${PV_NAME}"
+
+      - name: "[T2] Assert Node annotations updated by dry-run"
+        run: |
+          WORKER_JOB="${{ steps.dry-run-job.outputs.worker_job }}"
+          NODE_NAME=$(kubectl get job "${WORKER_JOB}" -n luks-trim -o jsonpath='{.spec.template.spec.nodeName}')
+          if [[ -z "${NODE_NAME}" ]]; then
+            echo "::error::T2: could not resolve nodeName for worker ${WORKER_JOB}"
+            exit 1
+          fi
+
+          NODE_JSON=$(kubectl get node "${NODE_NAME}" -o json)
+          STATUS=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          LASTRUN=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          MODE=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/mode"] // empty')
+          RESULT=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          [[ "${STATUS}" == "success" ]] || {
+            echo "::error::T2: expected node status=success, got '${STATUS}'"
+            exit 1
+          }
+          [[ "${LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T2: expected numeric node lastrun, got '${LASTRUN}'"
+            exit 1
+          }
+          [[ "${MODE}" == "dry-run" ]] || {
+            echo "::error::T2: expected node mode=dry-run, got '${MODE}'"
+            exit 1
+          }
+          [[ -n "${RESULT}" ]] || {
+            echo "::error::T2: missing node last-result annotation"
+            exit 1
+          }
+
+          echo "${RESULT}" | jq -e . >/dev/null
+          RESULT_STATUS=$(echo "${RESULT}" | jq -r '.status // empty')
+          RESULT_MODE=$(echo "${RESULT}" | jq -r '.mode // empty')
+          RESULT_RUN_EPOCH=$(echo "${RESULT}" | jq -r '.runEpoch // empty')
+
+          [[ "${RESULT_STATUS}" == "${STATUS}" ]] || {
+            echo "::error::T2: node JSON status '${RESULT_STATUS}' does not match flat '${STATUS}'"
+            exit 1
+          }
+          [[ "${RESULT_MODE}" == "${MODE}" ]] || {
+            echo "::error::T2: node JSON mode '${RESULT_MODE}' does not match flat '${MODE}'"
+            exit 1
+          }
+          [[ "${RESULT_RUN_EPOCH}" == "${LASTRUN}" ]] || {
+            echo "::error::T2: node runEpoch '${RESULT_RUN_EPOCH}' does not match lastrun '${LASTRUN}'"
+            exit 1
+          }
+
+          echo "[PASS] T2 node annotations validated on ${NODE_NAME}"
 
       - name: "[T2] Assert actualSize unchanged during dry run"
         run: |
@@ -2685,6 +2820,67 @@ jobs:
           }
           [[ -n "${RESULT_REASON}" ]] || {
             echo "::error::Expected non-empty reason in failure annotation"
+            exit 1
+          }
+
+          NODE_NAME=$(kubectl get job "${WORKER_JOB}" -n luks-trim -o jsonpath='{.spec.template.spec.nodeName}')
+          if [[ -z "${NODE_NAME}" ]]; then
+            echo "::error::T5: could not resolve nodeName for worker ${WORKER_JOB}"
+            exit 1
+          fi
+
+          NODE_JSON=$(kubectl get node "${NODE_NAME}" -o json)
+          NODE_STATUS=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/status"] // empty')
+          NODE_LASTRUN=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/lastrun"] // empty')
+          NODE_MODE=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/mode"] // empty')
+          NODE_FAILED=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/volumes-failed"] // empty')
+          NODE_RESULT=$(echo "${NODE_JSON}" | jq -r '.metadata.annotations["luks-trim/last-result"] // empty')
+
+          [[ "${NODE_STATUS}" == "failure" ]] || {
+            echo "::error::T5: expected node status=failure, got '${NODE_STATUS}'"
+            exit 1
+          }
+          [[ "${NODE_LASTRUN}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T5: expected numeric node lastrun, got '${NODE_LASTRUN}'"
+            exit 1
+          }
+          [[ "${NODE_MODE}" == "live" ]] || {
+            echo "::error::T5: expected node mode=live, got '${NODE_MODE}'"
+            exit 1
+          }
+          [[ "${NODE_FAILED}" =~ ^[0-9]+$ ]] || {
+            echo "::error::T5: expected numeric node volumes-failed, got '${NODE_FAILED}'"
+            exit 1
+          }
+          [[ "${NODE_FAILED}" -gt 0 ]] || {
+            echo "::error::T5: expected node volumes-failed > 0, got '${NODE_FAILED}'"
+            exit 1
+          }
+          [[ -n "${NODE_RESULT}" ]] || {
+            echo "::error::T5: missing node last-result annotation"
+            exit 1
+          }
+
+          echo "${NODE_RESULT}" | jq -e . >/dev/null
+          NODE_RESULT_STATUS=$(echo "${NODE_RESULT}" | jq -r '.status // empty')
+          NODE_RESULT_MODE=$(echo "${NODE_RESULT}" | jq -r '.mode // empty')
+          NODE_RESULT_RUN_EPOCH=$(echo "${NODE_RESULT}" | jq -r '.runEpoch // empty')
+          NODE_RESULT_FAILED=$(echo "${NODE_RESULT}" | jq -r '.totals.volumesFailed // empty')
+
+          [[ "${NODE_RESULT_STATUS}" == "${NODE_STATUS}" ]] || {
+            echo "::error::T5: node JSON status '${NODE_RESULT_STATUS}' does not match flat '${NODE_STATUS}'"
+            exit 1
+          }
+          [[ "${NODE_RESULT_MODE}" == "${NODE_MODE}" ]] || {
+            echo "::error::T5: node JSON mode '${NODE_RESULT_MODE}' does not match flat '${NODE_MODE}'"
+            exit 1
+          }
+          [[ "${NODE_RESULT_RUN_EPOCH}" == "${NODE_LASTRUN}" ]] || {
+            echo "::error::T5: node runEpoch '${NODE_RESULT_RUN_EPOCH}' does not match lastrun '${NODE_LASTRUN}'"
+            exit 1
+          }
+          [[ "${NODE_RESULT_FAILED}" == "${NODE_FAILED}" ]] || {
+            echo "::error::T5: node totals.volumesFailed '${NODE_RESULT_FAILED}' does not match flat '${NODE_FAILED}'"
             exit 1
           }
 

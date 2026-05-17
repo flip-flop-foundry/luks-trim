@@ -114,6 +114,29 @@ pvAnnotations:
   includeNodeName: true
 
 # ---------------------------------------------------------------------------
+# Kubernetes Node status annotations (optional)
+# ---------------------------------------------------------------------------
+# When enabled, each worker annotates its own Node with aggregate run status.
+#
+# Flat annotations for filtering:
+#   <keyPrefix>/status            = success | failure | skipped
+#   <keyPrefix>/lastrun           = unix epoch seconds
+#   <keyPrefix>/mode              = live | dry-run
+#   <keyPrefix>/volumes-processed = total Longhorn + Talos devices handled
+#   <keyPrefix>/volumes-failed    = total Longhorn + Talos failures
+#
+# Rich JSON payload:
+#   <keyPrefix>/last-result = compact JSON summary with totals and optional
+#   per-volume details (no secrets).
+nodeAnnotations:
+  enabled: false
+  # Prefix used for all Node annotation keys. Keep this as a single key
+  # segment (no slash).
+  keyPrefix: luks-trim
+  # Include per-volume arrays in <keyPrefix>/last-result.
+  includePerVolumeDetails: true
+
+# ---------------------------------------------------------------------------
 # Schedule
 # ---------------------------------------------------------------------------
 # Standard cron expression for when the coordinator runs.

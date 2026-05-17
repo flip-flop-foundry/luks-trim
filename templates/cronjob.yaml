@@ -71,6 +71,12 @@ spec:
                   value: {{ .Values.pvAnnotations.includeFailureReason | toString | quote }}
                 - name: PV_ANNOTATIONS_INCLUDE_NODE_NAME
                   value: {{ .Values.pvAnnotations.includeNodeName | toString | quote }}
+                - name: NODE_ANNOTATIONS_ENABLED
+                  value: {{ .Values.nodeAnnotations.enabled | toString | quote }}
+                - name: NODE_ANNOTATIONS_KEY_PREFIX
+                  value: {{ .Values.nodeAnnotations.keyPrefix | quote }}
+                - name: NODE_ANNOTATIONS_INCLUDE_PER_VOLUME_DETAILS
+                  value: {{ .Values.nodeAnnotations.includePerVolumeDetails | toString | quote }}
                 - name: TALOS_STATIC_KEY_ENABLED
                   value: {{ (and .Values.talos.enabled .Values.talos.staticKey.enabled) | toString | quote }}
                 - name: TALOS_STATIC_KEY_NS

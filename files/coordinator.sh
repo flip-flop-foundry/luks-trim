@@ -88,6 +88,9 @@ for NODE_NAME in $NODE_NAMES; do
     --arg pvap       "$PV_ANNOTATIONS_KEY_PREFIX" \
     --arg pvar       "$PV_ANNOTATIONS_INCLUDE_FAILURE_REASON" \
     --arg pvan       "$PV_ANNOTATIONS_INCLUDE_NODE_NAME" \
+    --arg nae        "$NODE_ANNOTATIONS_ENABLED" \
+    --arg nap        "$NODE_ANNOTATIONS_KEY_PREFIX" \
+    --arg napd       "$NODE_ANNOTATIONS_INCLUDE_PER_VOLUME_DETAILS" \
     --arg dr         "$DRY_RUN" \
     --arg tske       "$TALOS_STATIC_KEY_ENABLED" \
     --arg tskns      "$TALOS_STATIC_KEY_NS" \
@@ -149,6 +152,10 @@ for NODE_NAME in $NODE_NAMES; do
                 {name: "PV_ANNOTATIONS_KEY_PREFIX",  value: $pvap},
                 {name: "PV_ANNOTATIONS_INCLUDE_FAILURE_REASON", value: $pvar},
                 {name: "PV_ANNOTATIONS_INCLUDE_NODE_NAME", value: $pvan},
+                {name: "NODE_ANNOTATIONS_ENABLED",   value: $nae},
+                {name: "NODE_ANNOTATIONS_KEY_PREFIX", value: $nap},
+                {name: "NODE_ANNOTATIONS_INCLUDE_PER_VOLUME_DETAILS", value: $napd},
+                {name: "WORKER_NODE_NAME",           value: $node},
                 {name: "DRY_RUN",                    value: $dr},
                 {name: "TALOS_STATIC_KEY_ENABLED",   value: $tske},
                 {name: "TALOS_STATIC_KEY_NS",        value: $tskns},

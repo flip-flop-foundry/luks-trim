@@ -12,6 +12,10 @@
 #   PV_ANNOTATIONS_KEY_PREFIX  annotation key prefix (default: luks-trim)
 #   PV_ANNOTATIONS_INCLUDE_FAILURE_REASON  "true" | "false"
 #   PV_ANNOTATIONS_INCLUDE_NODE_NAME       "true" | "false"
+#   NODE_ANNOTATIONS_ENABLED    "true" | "false"
+#   NODE_ANNOTATIONS_KEY_PREFIX annotation key prefix (default: luks-trim)
+#   NODE_ANNOTATIONS_INCLUDE_PER_VOLUME_DETAILS "true" | "false"
+#   WORKER_NODE_NAME            Kubernetes Node name (injected by coordinator)
 #   DRY_RUN                    "true" | "false" — skip all writes when true
 #   TALOS_STATIC_KEY_ENABLED   "true" | "false"
 #   TALOS_STATIC_KEY_NS        namespace of the static key secret
@@ -41,7 +45,17 @@ KUBE_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 KUBE_API=https://kubernetes.default.svc
 RUN_EPOCH=$(date +%s)
 RUN_TS_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-WORKER_NODE=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
+WORKER_NODE="${WORKER_NODE_NAME:-}"
+[ -n "$WORKER_NODE" ] || WORKER_NODE=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
+
+NODE_LONGHORN_PROCESSED=0
+NODE_LONGHORN_FAILED=0
+NODE_TALOS_PROCESSED=0
+NODE_TALOS_FAILED=0
+NODE_TALOS_RECLAIMED_BYTES=0
+NODE_LONGHORN_DETAILS=""
+NODE_TALOS_DETAILS=""
+FSTRIM_LAST_BYTES=0
 
 # ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -109,6 +123,132 @@ kube_patch_with_status() {
     -H "Content-Type: application/merge-patch+json" \
     --data "$_json_patch" \
     "$KUBE_API$_api_path" 2>/dev/null
+}
+
+# append_json_line <existing-json-lines> <json-object-line>
+# Returns newline-delimited JSON object lines.
+append_json_line() {
+  _existing="$1"
+  _line="$2"
+
+  if [ -n "$_existing" ]; then
+    printf '%s\n%s' "$_existing" "$_line"
+  else
+    printf '%s' "$_line"
+  fi
+}
+
+# annotate_node <node-name> <run-exit-code>
+annotate_node() {
+  _node_name="$1"
+  _run_exit_code="$2"
+
+  if ! is_true "${NODE_ANNOTATIONS_ENABLED:-false}"; then
+    return 0
+  fi
+
+  if [ -z "$_node_name" ]; then
+    log_warn "node annotation enabled but node name is empty"
+    return 0
+  fi
+
+  _key_prefix="${NODE_ANNOTATIONS_KEY_PREFIX:-luks-trim}"
+  _key_prefix=$(printf '%s' "$_key_prefix" | sed 's:/*$::')
+  [ -z "$_key_prefix" ] && _key_prefix="luks-trim"
+
+  _mode="live"
+  is_true "${DRY_RUN:-false}" && _mode="dry-run"
+
+  _total_processed=$(( NODE_LONGHORN_PROCESSED + NODE_TALOS_PROCESSED ))
+  _total_failed=$(( NODE_LONGHORN_FAILED + NODE_TALOS_FAILED ))
+
+  _status="success"
+  if [ "$_total_processed" -eq 0 ]; then
+    _status="skipped"
+  fi
+  if [ "$_total_failed" -gt 0 ] || [ "$_run_exit_code" -ne 0 ]; then
+    _status="failure"
+  fi
+
+  _longhorn_details='[]'
+  if [ -n "$NODE_LONGHORN_DETAILS" ]; then
+    _longhorn_details=$(printf '%s\n' "$NODE_LONGHORN_DETAILS" | jq -s '.')
+  fi
+
+  _talos_details='[]'
+  if [ -n "$NODE_TALOS_DETAILS" ]; then
+    _talos_details=$(printf '%s\n' "$NODE_TALOS_DETAILS" | jq -s '.')
+  fi
+
+  _result_json=$(jq -cn \
+    --arg status "$_status" \
+    --arg mode "$_mode" \
+    --arg node "$_node_name" \
+    --arg epoch "$RUN_EPOCH" \
+    --arg ts "$RUN_TS_UTC" \
+    --arg lp "$NODE_LONGHORN_PROCESSED" \
+    --arg lf "$NODE_LONGHORN_FAILED" \
+    --arg tp "$NODE_TALOS_PROCESSED" \
+    --arg tf "$NODE_TALOS_FAILED" \
+    --arg trb "$NODE_TALOS_RECLAIMED_BYTES" \
+    --arg tproc "$_total_processed" \
+    --arg tfail "$_total_failed" \
+    --arg include_details "${NODE_ANNOTATIONS_INCLUDE_PER_VOLUME_DETAILS:-true}" \
+    --argjson longhorn_details "$_longhorn_details" \
+    --argjson talos_details "$_talos_details" \
+    '{
+      schema: "v1",
+      component: "node",
+      status: $status,
+      mode: $mode,
+      workerNode: $node,
+      runEpoch: ($epoch | tonumber),
+      runTime: $ts,
+      totals: {
+        volumesProcessed: ($tproc | tonumber),
+        volumesFailed: ($tfail | tonumber),
+        longhornProcessed: ($lp | tonumber),
+        longhornFailed: ($lf | tonumber),
+        talosProcessed: ($tp | tonumber),
+        talosFailed: ($tf | tonumber),
+        talosReclaimedBytes: ($trb | tonumber)
+      }
+    }
+    + (if $include_details == "true" then {
+        longhorn: {volumes: $longhorn_details},
+        talos: {volumes: $talos_details}
+      } else {} end)')
+
+  _patch_payload=$(jq -cn \
+    --arg status_key "$_key_prefix/status" \
+    --arg lastrun_key "$_key_prefix/lastrun" \
+    --arg mode_key "$_key_prefix/mode" \
+    --arg processed_key "$_key_prefix/volumes-processed" \
+    --arg failed_key "$_key_prefix/volumes-failed" \
+    --arg result_key "$_key_prefix/last-result" \
+    --arg status_val "$_status" \
+    --arg lastrun_val "$RUN_EPOCH" \
+    --arg mode_val "$_mode" \
+    --arg processed_val "$_total_processed" \
+    --arg failed_val "$_total_failed" \
+    --arg result_val "$_result_json" \
+    '{metadata: {annotations: {
+      ($status_key): $status_val,
+      ($lastrun_key): $lastrun_val,
+      ($mode_key): $mode_val,
+      ($processed_key): $processed_val,
+      ($failed_key): $failed_val,
+      ($result_key): $result_val
+    }}}')
+
+  _http_code=$(kube_patch_with_status "/api/v1/nodes/$_node_name" "$_patch_payload")
+  case "$_http_code" in
+    200|201) log_info "annotated Node $_node_name (status=$_status)" ;;
+    404) log_warn "Node $_node_name not found for annotation" ;;
+    403) log_warn "Node $_node_name annotation denied (missing patch permission?)" ;;
+    '')  log_warn "Node $_node_name annotation: no response from API" ;;
+    *)   log_warn "Node $_node_name annotation failed (HTTP $_http_code)" ;;
+  esac
 }
 
 # annotate_longhorn_pv <pv-name> <status> <reason> <encrypted> <discard-before>
@@ -289,6 +429,7 @@ try_key() {
 # In dry-run mode the mountpoint is identified but fstrim is not executed.
 fstrim_dev() {
   _dm_name="$1"
+  FSTRIM_LAST_BYTES=0
   _real_dev=$(readlink -f "/dev/mapper/$_dm_name" 2>/dev/null)
   _mountpoint=$(awk -v d1="$_real_dev" -v d2="/dev/mapper/$_dm_name" \
     '$1==d1 || $1==d2 {print $2; exit}' /proc/1/mounts 2>/dev/null)
@@ -313,12 +454,16 @@ fstrim_dev() {
     _trim_rc=$?
     printf '%s\n' "$_trim_output" | sed 's/^/    [dry-run] /'
     [ "$_trim_rc" -eq 0 ] || echo "    [fstrim] [dry-run] fstrim -n exited $_trim_rc"
+    FSTRIM_LAST_BYTES=0
     return 0
   fi
 
   _trim_output=$(nsenter --mount=/proc/1/ns/mnt -- fstrim -v "$_mountpoint" 2>&1)
   _trim_rc=$?
   printf '%s\n' "$_trim_output" | sed 's/^/    /'
+  _trim_bytes=$(printf '%s\n' "$_trim_output" | sed -n 's/.*(\([0-9][0-9]*\) bytes).*/\1/p' | head -1)
+  [ -n "$_trim_bytes" ] || _trim_bytes=0
+  FSTRIM_LAST_BYTES="$_trim_bytes"
   [ "$_trim_rc" -eq 0 ] || echo "    [fstrim] [warn] fstrim exited $_trim_rc"
 }
 
@@ -345,16 +490,24 @@ process_longhorn_volumes() {
     _global_key_b64=$(fetch_secret_key "$GLOBAL_KEY_NS" "$GLOBAL_KEY_SECRET" "$GLOBAL_KEY_FIELD")
   fi
 
+  _processed_count=0
   _failed_count=0
   for _device in "$_device_dir"/*; do
     [ -e "$_device" ] || continue
     _volume_name=$(basename "$_device")
+    _processed_count=$(( _processed_count + 1 ))
 
     # Unencrypted Longhorn volumes: skip key operations.
     # TRIM remains Longhorn RecurringJob responsibility.
     if ! cryptsetup isLuks "$_device" >/dev/null 2>&1; then
       echo "  $_volume_name: not LUKS-encrypted — skipping (trim handled by Longhorn RecurringJob)"
       annotate_longhorn_pv "$_volume_name" "skipped" "not LUKS-encrypted; trim handled by Longhorn RecurringJob" "false" "false" "false" "false" "" "false"
+      _detail_json=$(jq -cn \
+        --arg volume "$_volume_name" \
+        --arg status "skipped" \
+        --arg reason "not LUKS-encrypted; trim handled by Longhorn RecurringJob" \
+        '{volume: $volume, status: $status, encrypted: false, keyIdentified: false, reason: $reason}')
+      NODE_LONGHORN_DETAILS=$(append_json_line "$NODE_LONGHORN_DETAILS" "$_detail_json")
       continue
     fi
 
@@ -368,6 +521,12 @@ process_longhorn_volumes() {
       _discard_after="true"
       echo "  $_volume_name: allow_discards already active, skipping"
       annotate_longhorn_pv "$_volume_name" "skipped" "allow_discards already active" "true" "$_discard_before" "$_discard_after" "$_key_identified" "" "$_would_apply"
+      _detail_json=$(jq -cn \
+        --arg volume "$_volume_name" \
+        --arg status "skipped" \
+        --arg reason "allow_discards already active" \
+        '{volume: $volume, status: $status, encrypted: true, keyIdentified: false, allowDiscardsBefore: true, allowDiscardsAfter: true, reason: $reason}')
+      NODE_LONGHORN_DETAILS=$(append_json_line "$NODE_LONGHORN_DETAILS" "$_detail_json")
       continue
     fi
 
@@ -420,17 +579,34 @@ process_longhorn_volumes() {
         _would_apply="true"
         echo "  $_volume_name: [dry-run] key valid — allow-discards would be applied (key: $_applied_key_label)"
         annotate_longhorn_pv "$_volume_name" "success" "key validated in dry-run; allow_discards would be applied" "true" "$_discard_before" "$_discard_after" "$_key_identified" "$_applied_key_label" "$_would_apply"
+        _detail_json=$(jq -cn \
+          --arg volume "$_volume_name" \
+          --arg reason "key validated in dry-run; allow_discards would be applied" \
+          '{volume: $volume, status: "success", encrypted: true, keyIdentified: true, allowDiscardsBefore: false, allowDiscardsAfter: false, reason: $reason}')
+        NODE_LONGHORN_DETAILS=$(append_json_line "$NODE_LONGHORN_DETAILS" "$_detail_json")
       else
         _discard_after="true"
         echo "  $_volume_name: allow-discards enabled (key: $_applied_key_label)"
         annotate_longhorn_pv "$_volume_name" "success" "allow_discards enabled" "true" "$_discard_before" "$_discard_after" "$_key_identified" "$_applied_key_label" "$_would_apply"
+        _detail_json=$(jq -cn \
+          --arg volume "$_volume_name" \
+          '{volume: $volume, status: "success", encrypted: true, keyIdentified: true, allowDiscardsBefore: false, allowDiscardsAfter: true, reason: "allow_discards enabled"}')
+        NODE_LONGHORN_DETAILS=$(append_json_line "$NODE_LONGHORN_DETAILS" "$_detail_json")
       fi
     else
       echo "  [ERROR] $_volume_name: no matching key found — allow-discards NOT enabled"
       annotate_longhorn_pv "$_volume_name" "failure" "no matching key found; allow_discards not enabled" "true" "$_discard_before" "$_discard_after" "$_key_identified" "" "$_would_apply"
       _failed_count=$(( _failed_count + 1 ))
+      _detail_json=$(jq -cn \
+        --arg volume "$_volume_name" \
+        --arg reason "no matching key found; allow_discards not enabled" \
+        '{volume: $volume, status: "failure", encrypted: true, keyIdentified: false, allowDiscardsBefore: false, allowDiscardsAfter: false, reason: $reason}')
+      NODE_LONGHORN_DETAILS=$(append_json_line "$NODE_LONGHORN_DETAILS" "$_detail_json")
     fi
   done
+
+  NODE_LONGHORN_PROCESSED="$_processed_count"
+  NODE_LONGHORN_FAILED="$_failed_count"
 
   if [ "$_failed_count" -gt 0 ]; then
     echo "  [ERROR] $_failed_count Longhorn volume(s) could not be unlocked. Check key configuration."
@@ -573,17 +749,23 @@ process_talos_volumes() {
   fi
 
   _found_mapper=false
+  _processed_count=0
   _failed_count=0
+  _reclaimed_total=0
   for _mapper_path in /dev/mapper/luks2-*; do
     [ -e "$_mapper_path" ] || continue
     _found_mapper=true
+    _processed_count=$(( _processed_count + 1 ))
     _dm_name=$(basename "$_mapper_path")
     echo "  $_dm_name:"
 
     _discard_enabled=false
+    _entry_reason=""
+    FSTRIM_LAST_BYTES=0
     if has_allow_discards_active "$_dm_name"; then
       echo "    allow_discards already active"
       _discard_enabled=true
+      _entry_reason="allow_discards already active"
     fi
 
     if ! $_discard_enabled; then
@@ -591,6 +773,11 @@ process_talos_volumes() {
       if [ -z "$_backing_device" ]; then
         echo "    [ERROR] cannot determine backing device for $_dm_name"
         _failed_count=$(( _failed_count + 1 ))
+        _detail_json=$(jq -cn \
+          --arg mapper "$_dm_name" \
+          --arg reason "cannot determine backing device" \
+          '{mapper: $mapper, status: "failure", allowDiscards: false, reclaimedBytes: 0, reason: $reason}')
+        NODE_TALOS_DETAILS=$(append_json_line "$NODE_TALOS_DETAILS" "$_detail_json")
         continue
       fi
       echo "    backing: $_backing_device"
@@ -645,11 +832,39 @@ process_talos_volumes() {
       if ! $_discard_enabled; then
         echo "    [ERROR] no key unlocked $_dm_name — allow-discards NOT enabled"
         _failed_count=$(( _failed_count + 1 ))
+        _entry_reason="no key unlocked; allow_discards not enabled"
       fi
     fi
 
-    $_discard_enabled && fstrim_dev "$_dm_name"
+    _detail_status="success"
+    if $_discard_enabled; then
+      fstrim_dev "$_dm_name"
+      _reclaimed_total=$(( _reclaimed_total + FSTRIM_LAST_BYTES ))
+      [ -n "$_entry_reason" ] || _entry_reason="trim path executed"
+    else
+      _detail_status="failure"
+      [ -n "$_entry_reason" ] || _entry_reason="allow_discards inactive"
+    fi
+
+    _detail_json=$(jq -cn \
+      --arg mapper "$_dm_name" \
+      --arg status "$_detail_status" \
+      --arg discard "$_discard_enabled" \
+      --arg reclaimed "$FSTRIM_LAST_BYTES" \
+      --arg reason "$_entry_reason" \
+      '{
+        mapper: $mapper,
+        status: $status,
+        allowDiscards: ($discard == "true"),
+        reclaimedBytes: ($reclaimed | tonumber)
+      }
+      + (if $reason != "" then {reason: $reason} else {} end)')
+    NODE_TALOS_DETAILS=$(append_json_line "$NODE_TALOS_DETAILS" "$_detail_json")
   done
+
+  NODE_TALOS_PROCESSED="$_processed_count"
+  NODE_TALOS_FAILED="$_failed_count"
+  NODE_TALOS_RECLAIMED_BYTES="$_reclaimed_total"
 
   $_found_mapper || log_info "No /dev/mapper/luks2-* devices on this node"
   if [ "$_failed_count" -gt 0 ]; then
@@ -660,7 +875,7 @@ process_talos_volumes() {
 {{- end }}
 
 # ── Main ─────────────────────────────────────────────────────────────────
-echo "$(date) - luks-trim starting on $(cat /proc/sys/kernel/hostname)"
+echo "$(date) - luks-trim starting on ${WORKER_NODE}"
 echo "  longhorn=${LONGHORN_ENABLED} talos=${TALOS_ENABLED} dry_run=${DRY_RUN:-false}"
 _exit_code=0
 
@@ -670,6 +885,8 @@ fi
 if is_true "${TALOS_ENABLED:-false}"; then
   process_talos_volumes || _exit_code=1
 fi
+
+annotate_node "$WORKER_NODE" "$_exit_code"
 
 if [ "$_exit_code" -ne 0 ]; then
   echo "$(date) - Done with ERRORS (exit $_exit_code) — review [ERROR] lines above."
