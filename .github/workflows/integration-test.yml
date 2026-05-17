@@ -1724,6 +1724,9 @@ jobs:
               kubectl get "job/${worker_job}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o wide || true
               kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 || true
+              for pod in $(kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o name 2>/dev/null); do
+                kubectl describe -n luks-trim "$pod" || true
+              done
               return 1
             fi
 
@@ -2005,6 +2008,7 @@ jobs:
             --namespace   luks-trim \
             --reuse-values \
             --set talos.enabled=true \
+            --set talos.machineConfig.enabled=false \
             --set talos.staticKey.enabled=true \
             --set talos.staticKey.secretNamespace=luks-trim \
             --set talos.staticKey.secretName=talos-static-key \
