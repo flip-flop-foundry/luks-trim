@@ -43,6 +43,22 @@ rm /tmp/talosctl
 talosctl version --client
 ok "talosctl ${TALOS_VERSION} installed"
 
+# ─── shell tooling (shellcheck, shfmt, yq) ───────────────────────────────────
+info "Installing shell tooling (shellcheck, shfmt, yq)…"
+MISSING_SHELL_TOOLS=()
+for tool in shellcheck shfmt yq; do
+  command -v "${tool}" >/dev/null 2>&1 || MISSING_SHELL_TOOLS+=("${tool}")
+done
+if [[ ${#MISSING_SHELL_TOOLS[@]} -gt 0 ]]; then
+  # apt-get lists may have been cleared; refresh before installing.
+  _sudo apt-get update -qq
+  _sudo apt-get install -y --no-install-recommends "${MISSING_SHELL_TOOLS[@]}"
+fi
+shellcheck --version | head -1
+shfmt --version
+yq --version || yq -V || true
+ok "Shell tooling installed"
+
 # ─── yamllint ────────────────────────────────────────────────────────────────
 info "Installing yamllint…"
 if ! command -v yamllint >/dev/null 2>&1; then
@@ -58,7 +74,7 @@ ok "yamllint installed"
 info "Verifying tool availability…"
 
 MISSING=()
-for tool in helm kubectl gh talosctl jq curl yamllint docker; do
+for tool in helm kubectl gh talosctl jq curl yq shellcheck shfmt yamllint docker; do
   if command -v "${tool}" >/dev/null 2>&1; then
     printf '  %-12s %s\n' "${tool}" "$(${tool} version --short 2>/dev/null \
       || ${tool} --version 2>/dev/null \
@@ -78,6 +94,7 @@ echo ""
 echo "  Quick reference:"
 echo "    helm lint .                   # lint the Helm chart"
 echo "    helm template . | yamllint -  # render + lint templates"
+echo "    shellcheck files/*.sh scripts/*.sh  # lint shell scripts"
 echo "    docker build -t luks-trim .   # build the worker image"
 echo "    make gha-watch                # watch the latest GHA run"
 echo "    gh auth login                 # authenticate gh CLI (first time)"

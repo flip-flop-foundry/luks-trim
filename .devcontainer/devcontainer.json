@@ -27,7 +27,8 @@
   },
 
   // ─── Post-create setup ───────────────────────────────────────────────────
-  // Installs tooling that has no devcontainer feature: talosctl + yamllint.
+  // Installs tooling that has no devcontainer feature:
+  // talosctl + shellcheck + shfmt + yq + yamllint.
   "postCreateCommand": "bash .devcontainer/post-create.sh",
 
   // ─── VS Code extensions ──────────────────────────────────────────────────
