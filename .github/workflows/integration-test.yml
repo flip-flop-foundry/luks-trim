@@ -176,7 +176,7 @@ jobs:
             https://factory.talos.dev/schematics)
           ID=$(echo "$RESP" | jq -r '.id')
           if [[ -z "$ID" || "$ID" == "null" ]]; then
-            echo "[FAIL] Unexpected response from factory.talos.dev: $RESP"
+            echo "::error::Unexpected response from factory.talos.dev: $RESP"
             exit 1
           fi
           echo "id=${ID}" >> "$GITHUB_OUTPUT"
@@ -237,7 +237,7 @@ jobs:
 
           AVAILABLE_MIB=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
           if [[ -z "${AVAILABLE_MIB}" ]]; then
-            echo "[FAIL] Could not determine free disk space under $HOME"
+            echo "::error::Could not determine free disk space under $HOME"
             exit 1
           fi
 
@@ -255,7 +255,7 @@ jobs:
           fi
 
           if (( TALOS_DISK_MIB < MIN_DISK_MIB )); then
-            echo "[FAIL] Not enough free disk for Talos VM preallocation"
+            echo "::error::Not enough free disk for Talos VM preallocation"
             echo "[diagnostic] available=${AVAILABLE_MIB}MiB reserved=${RESERVED_MIB}MiB required_min=${MIN_DISK_MIB}MiB"
             df -h "$HOME" || true
             exit 1
@@ -448,7 +448,7 @@ jobs:
           trap - EXIT
 
           if [[ "${CREATE_RC}" -ne 0 ]]; then
-            echo "[FAIL] talosctl cluster create failed with exit code ${CREATE_RC}"
+            echo "::error::talosctl cluster create failed with exit code ${CREATE_RC}"
             echo "[diagnostic] qemu processes:"
             ps -ef | grep -E "qemu-system|qemu-kvm|dnsmasq|tap|bridge" | grep -v grep || true
             echo "[diagnostic] host networking:"
@@ -468,7 +468,7 @@ jobs:
           # Export kubeconfig to the workspace path consumed by later steps.
           # qemu create writes talosconfig directly to $TALOSCONFIG.
           if [[ ! -f "$TALOSCONFIG" ]]; then
-            echo "[FAIL] Expected talosconfig not found at ${TALOSCONFIG}"
+            echo "::error::Expected talosconfig not found at ${TALOSCONFIG}"
             exit 1
           fi
 
@@ -495,7 +495,7 @@ jobs:
           fi
 
           if [[ -z "${TALOS_NODE}" ]]; then
-            echo "[FAIL] Could not determine Talos node target from talosconfig"
+            echo "::error::Could not determine Talos node target from talosconfig"
             sed -n '1,40p' /tmp/talos-config-info-postcreate.log || true
             exit 1
           fi
@@ -530,7 +530,7 @@ jobs:
           fi
 
           if [[ -z "${TALOS_NODE}" ]]; then
-            echo "[FAIL] Could not resolve TALOS_NODE for uservolume verification"
+            echo "::error::Could not resolve TALOS_NODE for uservolume verification"
             talosctl --talosconfig "$TALOSCONFIG" config info -o yaml || true
             exit 1
           fi
@@ -540,7 +540,7 @@ jobs:
 
           VOL_YAML=$(talosctl --talosconfig "$TALOSCONFIG" --nodes "${TALOS_NODE}" get volumestatus "${VOL_ID}" -o yaml)
           if ! echo "${VOL_YAML}" | grep -qi 'phase: ready'; then
-            echo "[FAIL] Talos uservolume ${VOL_ID} is not ready"
+            echo "::error::Talos uservolume ${VOL_ID} is not ready"
             exit 1
           fi
 
@@ -549,12 +549,12 @@ jobs:
           echo "${MOUNT_YAML}"
 
           if ! echo "${MOUNT_YAML}" | grep -q "target: /var/mnt/${TALOS_USERVOLUME_NAME}"; then
-            echo "[FAIL] Talos uservolume mount target /var/mnt/${TALOS_USERVOLUME_NAME} not found"
+            echo "::error::Talos uservolume mount target /var/mnt/${TALOS_USERVOLUME_NAME} not found"
             exit 1
           fi
 
           if ! echo "${MOUNT_YAML}" | grep -Eq "source: /dev/(mapper/luks2-|dm-)"; then
-            echo "[FAIL] Talos uservolume source is not a dm-crypt device"
+            echo "::error::Talos uservolume source is not a dm-crypt device"
             exit 1
           fi
 
@@ -586,7 +586,7 @@ jobs:
           else
             LONGHORN_VERSION=$(helm search repo longhorn/longhorn --versions | awk 'NR==2 {print $2}')
             if [[ -z "$LONGHORN_VERSION" ]]; then
-              echo "[FAIL] Could not detect latest Longhorn chart version from Helm repo"
+              echo "::error::Could not detect latest Longhorn chart version from Helm repo"
               exit 1
             fi
             echo "Longhorn version source: auto-detected latest from Helm repo"
@@ -623,7 +623,7 @@ jobs:
             set -e
 
             if [[ "${HELM_RC}" -ne 0 ]]; then
-              echo "[FAIL] Longhorn helm install failed with exit code ${HELM_RC}"
+              echo "::error::Longhorn helm install failed with exit code ${HELM_RC}"
               echo "[diagnostic] helm output:"
               sed -n '1,220p' /tmp/longhorn-install.log || true
               echo "[diagnostic] longhorn events:"
@@ -908,7 +908,7 @@ jobs:
           EOF
           if ! kubectl wait pod/t0-filler -n luks-trim-test \
             --for=condition=Ready --timeout=2m; then
-            echo "[FAIL] t0-filler did not become Ready within 2m"
+            echo "::error::t0-filler did not become Ready within 2m"
             kubectl get pod t0-filler -n luks-trim-test -o wide || true
             kubectl describe pod t0-filler -n luks-trim-test || true
             kubectl get pvc t0-new-vol -n luks-trim-test -o wide || true
@@ -954,7 +954,7 @@ jobs:
           kubectl create job "${JOB}" --from=cronjob/luks-trim -n luks-trim
 
           if ! kubectl wait -n luks-trim --for=condition=complete "job/${JOB}" --timeout=5m; then
-            echo "[FAIL] T0 coordinator ${JOB} did not complete"
+            echo "::error::T0 coordinator ${JOB} did not complete"
             kubectl get "job/${JOB}" -n luks-trim -o wide || true
             kubectl logs -n luks-trim -l "job-name=${JOB}" --tail=-1 || true
             kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
@@ -977,13 +977,13 @@ jobs:
           done
 
           if [[ -z "$WORKER_JOB" ]]; then
-            echo "[FAIL] No worker Job appeared within 60 s for T0"
+            echo "::error::No worker Job appeared within 60 s for T0"
             exit 1
           fi
           echo "worker_job=${WORKER_JOB}" >> "$GITHUB_OUTPUT"
 
           if ! kubectl wait -n luks-trim --for=condition=complete "job/${WORKER_JOB}" --timeout=5m; then
-            echo "[FAIL] T0 worker ${WORKER_JOB} did not complete"
+            echo "::error::T0 worker ${WORKER_JOB} did not complete"
             kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
             kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
             kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 || true
@@ -1008,13 +1008,13 @@ jobs:
           # lines MUST appear (unlike T2 where they may be absent if T1 already
           # set the flag).
           if [[ "${DRYRUN_COUNT}" -eq 0 ]]; then
-            echo "[FAIL] Expected [dry-run] lines on new volume but found none"
+            echo "::error::Expected [dry-run] lines on new volume but found none"
             echo "$LOGS"
             exit 1
           fi
 
           if [[ "${ERROR_COUNT}" -gt 0 ]]; then
-            echo "[FAIL] [ERROR] lines present during T0 dry-run:"
+            echo "::error::[ERROR] lines present during T0 dry-run:"
             echo "$LOGS" | grep '\[ERROR\]'
             exit 1
           fi
@@ -1038,7 +1038,7 @@ jobs:
           THRESHOLD=$(( SIZE_BEFORE * 5 / 100 ))
 
           if [[ "${DELTA}" -gt "${THRESHOLD}" ]]; then
-            echo "[FAIL] actualSize changed by ${DELTA} bytes during T0 dry-run (threshold ${THRESHOLD})"
+            echo "::error::actualSize changed by ${DELTA} bytes during T0 dry-run (threshold ${THRESHOLD})"
             exit 1
           fi
 
@@ -1104,7 +1104,7 @@ jobs:
             for _ in $(seq 1 18); do
               VOL_STATE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.state}' 2>/dev/null || true)
               if [[ "${VOL_STATE}" == "faulted" ]]; then
-                echo "[FAIL] Longhorn volume ${VOL_NAME} became faulted before pod readiness"
+                echo "::error::Longhorn volume ${VOL_NAME} became faulted before pod readiness"
                 kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o wide || true
                 kubectl describe volume.longhorn.io "${VOL_NAME}" -n longhorn-system || true
                 kubectl get nodes.longhorn.io -n longhorn-system -o wide || true
@@ -1117,7 +1117,7 @@ jobs:
 
           if ! kubectl wait pod/filler -n luks-trim-test \
             --for=condition=Ready --timeout=2m; then
-            echo "[FAIL] filler did not become Ready within 2m"
+            echo "::error::filler did not become Ready within 2m"
             kubectl get pod filler -n luks-trim-test -o wide || true
             kubectl describe pod filler -n luks-trim-test || true
             kubectl get pvc test-vol -n luks-trim-test -o wide || true
@@ -1157,7 +1157,7 @@ jobs:
           echo "Longhorn actualSize after 768 MiB write: ${SIZE} bytes"
 
           if [[ "${SIZE}" -lt $((500 * 1024 * 1024)) ]]; then
-            echo "[FAIL] actualSize ${SIZE} is below 500 MiB after a 768 MiB write"
+            echo "::error::actualSize ${SIZE} is below 500 MiB after a 768 MiB write"
             exit 1
           fi
 
@@ -1225,7 +1225,7 @@ jobs:
             fi
 
             if (( ${COORD_FAILED:-0} >= 1 )); then
-              echo "[FAIL] Coordinator job ${JOB} failed"
+              echo "::error::Coordinator job ${JOB} failed"
               kubectl get "job/${JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
               print_console_logs "coordinator-failed" "job-name=${JOB}"
@@ -1234,7 +1234,7 @@ jobs:
             fi
 
             if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
-              echo "[FAIL] Coordinator job ${JOB} did not complete within timeout"
+              echo "::error::Coordinator job ${JOB} did not complete within timeout"
               kubectl get "job/${JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
               print_console_logs "coordinator-timeout" "job-name=${JOB}"
@@ -1267,7 +1267,7 @@ jobs:
           done
 
           if [[ -z "$WORKER_JOB" ]]; then
-            echo "[FAIL] No worker Job appeared within 60 s of coordinator completing"
+            echo "::error::No worker Job appeared within 60 s of coordinator completing"
             print_namespace_events "worker-missing"
             exit 1
           fi
@@ -1290,7 +1290,7 @@ jobs:
             fi
 
             if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
-              echo "[FAIL] Worker job ${WORKER_JOB} did not complete within timeout"
+              echo "::error::Worker job ${WORKER_JOB} did not complete within timeout"
               kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
               print_console_logs "worker-timeout" "job-name=${WORKER_JOB}"
@@ -1329,7 +1329,7 @@ jobs:
           ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
           echo "[INFO] [ERROR] lines in worker logs: ${ERROR_COUNT}"
           if [[ "${ERROR_COUNT}" -gt 0 ]]; then
-            echo "[FAIL] Worker pod logged ERROR lines:"
+            echo "::error::Worker pod logged ERROR lines:"
             echo "$WORKER_LOGS" | grep '\[ERROR\]'
             exit 1
           fi
@@ -1337,7 +1337,7 @@ jobs:
           JOB_FAILED=$(kubectl get job "${WORKER_JOB}" -n luks-trim \
             -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
           if [[ "${JOB_FAILED}" -gt 0 ]]; then
-            echo "[FAIL] Worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
+            echo "::error::Worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
             print_worker_termination_details "${WORKER_JOB}"
             echo "$WORKER_LOGS"
             exit 1
@@ -1351,7 +1351,7 @@ jobs:
           TRIGGER_JOB="${CRONJOB_NAME}-manual-$(date +%s)"
 
           if ! kubectl -n longhorn-system get cronjob "${CRONJOB_NAME}" >/dev/null 2>&1; then
-            echo "[FAIL] Expected Longhorn CronJob ${CRONJOB_NAME} was not found"
+            echo "::error::Expected Longhorn CronJob ${CRONJOB_NAME} was not found"
             echo "[diagnostic] available CronJobs in longhorn-system:"
             kubectl -n longhorn-system get cronjobs || true
             exit 1
@@ -1360,7 +1360,7 @@ jobs:
           kubectl -n longhorn-system create job "${TRIGGER_JOB}" --from=cronjob/"${CRONJOB_NAME}"
 
           if ! kubectl -n longhorn-system wait --for=condition=complete "job/${TRIGGER_JOB}" --timeout=5m; then
-            echo "[FAIL] Triggered Longhorn trim job ${TRIGGER_JOB} did not complete"
+            echo "::error::Triggered Longhorn trim job ${TRIGGER_JOB} did not complete"
             kubectl -n longhorn-system get "job/${TRIGGER_JOB}" -o wide || true
             kubectl -n longhorn-system get pods -l "job-name=${TRIGGER_JOB}" -o wide || true
             kubectl -n longhorn-system logs -l "job-name=${TRIGGER_JOB}" --tail=-1 || true
@@ -1393,7 +1393,7 @@ jobs:
           # Enforce reclaim expectation as a hard gate for this workflow.
           MIN_RECLAIM=$(( 256 * 1024 * 1024 ))
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
-            echo "[FAIL] Less than 256 MiB reclaimed (${RECLAIMED} bytes)."
+            echo "::error::Less than 256 MiB reclaimed (${RECLAIMED} bytes)."
             echo "       Expected Longhorn filesystem-trim to reclaim at least ${MIN_RECLAIM} bytes."
             exit 1
           fi
@@ -1476,7 +1476,7 @@ jobs:
             fi
 
             if (( ${COORD_FAILED:-0} >= 1 )); then
-              echo "[FAIL] Dry-run coordinator job ${JOB} failed"
+              echo "::error::Dry-run coordinator job ${JOB} failed"
               kubectl get "job/${JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
               print_console_logs "dryrun-coordinator-failed" "job-name=${JOB}"
@@ -1485,7 +1485,7 @@ jobs:
             fi
 
             if [[ $SECONDS -ge $COORD_DEADLINE ]]; then
-              echo "[FAIL] Dry-run coordinator job ${JOB} did not complete within timeout"
+              echo "::error::Dry-run coordinator job ${JOB} did not complete within timeout"
               kubectl get "job/${JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${JOB}" -o wide || true
               print_console_logs "dryrun-coordinator-timeout" "job-name=${JOB}"
@@ -1516,7 +1516,7 @@ jobs:
           done
 
           if [[ -z "$WORKER_JOB" ]]; then
-            echo "[FAIL] No new worker Job appeared within 60 s"
+            echo "::error::No new worker Job appeared within 60 s"
             echo "[diagnostic] worker jobs before dry-run coordinator:"
             echo "$PREV_JOBS"
             echo "[diagnostic] current worker jobs:"
@@ -1544,7 +1544,7 @@ jobs:
             fi
 
             if [[ $SECONDS -ge $WORKER_DEADLINE ]]; then
-              echo "[FAIL] Dry-run worker job ${WORKER_JOB} did not complete within timeout"
+              echo "::error::Dry-run worker job ${WORKER_JOB} did not complete within timeout"
               kubectl get "job/${WORKER_JOB}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${WORKER_JOB}" -o wide || true
               print_console_logs "dryrun-worker-timeout" "job-name=${WORKER_JOB}"
@@ -1580,7 +1580,7 @@ jobs:
           JOB_FAILED=$(kubectl get job "${WORKER_JOB}" -n luks-trim \
             -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)
           if [[ "${JOB_FAILED}" -gt 0 ]]; then
-            echo "[FAIL] Dry-run worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
+            echo "::error::Dry-run worker Job ${WORKER_JOB} has ${JOB_FAILED} failed pod(s)"
             print_worker_termination_details "${WORKER_JOB}"
             kubectl logs -n luks-trim -l "job-name=${WORKER_JOB}" --tail=-1 2>/dev/null || true
             exit 1
@@ -1599,14 +1599,14 @@ jobs:
             if echo "$LOGS" | grep -q "allow_discards already active, skipping"; then
               echo "[INFO] No [dry-run] lines because allow_discards was already active."
             else
-              echo "[FAIL] No [dry-run] lines found in worker logs (dryRun=true):"
+              echo "::error::No [dry-run] lines found in worker logs (dryRun=true):"
               echo "$LOGS"
               exit 1
             fi
           fi
 
           if [[ "${ERROR_COUNT}" -gt 0 ]]; then
-            echo "[FAIL] [ERROR] lines in worker logs during dry run:"
+            echo "::error::[ERROR] lines in worker logs during dry run:"
             echo "$LOGS" | grep '\[ERROR\]'
             exit 1
           fi
@@ -1636,7 +1636,7 @@ jobs:
           echo "Delta: ${DELTA} bytes  (threshold: ${THRESHOLD})"
 
           if [[ "${DELTA}" -gt "${THRESHOLD}" ]]; then
-            echo "[FAIL] actualSize changed by ${DELTA} bytes during dry run " \
+            echo "::error::actualSize changed by ${DELTA} bytes during dry run " \
                  "(threshold ${THRESHOLD}).  fstrim must NOT run in dry-run mode."
             exit 1
           fi
@@ -1672,7 +1672,7 @@ jobs:
             kubectl -n longhorn-system create job "${trigger_job}" --from=cronjob/"${cronjob_name}"
 
             if ! kubectl -n longhorn-system wait --for=condition=complete "job/${trigger_job}" --timeout=5m; then
-              echo "[FAIL] Longhorn trim job ${trigger_job} did not complete"
+              echo "::error::Longhorn trim job ${trigger_job} did not complete"
               kubectl -n longhorn-system get "job/${trigger_job}" -o wide || true
               kubectl -n longhorn-system get pods -l "job-name=${trigger_job}" -o wide || true
               kubectl -n longhorn-system logs -l "job-name=${trigger_job}" --tail=-1 || true
@@ -1692,7 +1692,7 @@ jobs:
             kubectl create job "${coord_job}" --from=cronjob/luks-trim -n luks-trim
 
             if ! kubectl wait -n luks-trim --for=condition=complete "job/${coord_job}" --timeout=5m; then
-              echo "[FAIL] Coordinator ${coord_job} did not complete"
+              echo "::error::Coordinator ${coord_job} did not complete"
               kubectl get "job/${coord_job}" -n luks-trim -o wide || true
               kubectl logs -n luks-trim -l "job-name=${coord_job}" --tail=-1 || true
               kubectl -n luks-trim get events --sort-by=.lastTimestamp | tail -n 80 || true
@@ -1714,13 +1714,13 @@ jobs:
             done
 
             if [[ -z "$worker_job" ]]; then
-              echo "[FAIL] No new worker job found for case ${case_label}"
+              echo "::error::No new worker job found for case ${case_label}"
               kubectl get jobs -n luks-trim -l "luks-trim/role=worker" -o wide || true
               return 1
             fi
 
             if ! kubectl wait -n luks-trim --for=condition=complete "job/${worker_job}" --timeout=5m; then
-              echo "[FAIL] Worker ${worker_job} did not complete"
+              echo "::error::Worker ${worker_job} did not complete"
               kubectl get "job/${worker_job}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o wide || true
               kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 || true
@@ -1735,7 +1735,7 @@ jobs:
             local error_count
             error_count=$(echo "$logs" | grep -c '\[ERROR\]' || true)
             if [[ "$error_count" -gt 0 ]]; then
-              echo "[FAIL] Worker ${worker_job} emitted [ERROR] lines"
+              echo "::error::Worker ${worker_job} emitted [ERROR] lines"
               echo "$logs" | grep '\[ERROR\]' || true
               return 1
             fi
@@ -1806,7 +1806,7 @@ jobs:
             size_after_write=$(kubectl get volume.longhorn.io "${vol_name}" -n longhorn-system -o jsonpath='{.status.actualSize}')
             local write_floor=$(( write_mib * 1024 * 1024 * 70 / 100 ))
             if [[ "${size_after_write}" -lt "${write_floor}" ]]; then
-              echo "[FAIL] ${case_label}: actualSize ${size_after_write} below floor ${write_floor} after write"
+              echo "::error::${case_label}: actualSize ${size_after_write} below floor ${write_floor} after write"
               return 1
             fi
 
@@ -1821,12 +1821,12 @@ jobs:
               run_luks_trim_and_assert_worker "${case_label}"
               if [[ "${case_label}" == "plain" ]]; then
                 if echo "$LAST_WORKER_LOGS" | grep -q "running fstrim"; then
-                  echo "[FAIL] ${case_label}: worker attempted direct fstrim on Longhorn volume"
+                  echo "::error::${case_label}: worker attempted direct fstrim on Longhorn volume"
                   echo "$LAST_WORKER_LOGS"
                   return 1
                 fi
                 if ! echo "$LAST_WORKER_LOGS" | grep -q "not LUKS-encrypted"; then
-                  echo "[FAIL] ${case_label}: worker did not report non-LUKS Longhorn handling"
+                  echo "::error::${case_label}: worker did not report non-LUKS Longhorn handling"
                   echo "$LAST_WORKER_LOGS"
                   return 1
                 fi
@@ -1853,13 +1853,13 @@ jobs:
                 if [[ "${run_luks_trim}" == "true" ]] && echo "$LAST_WORKER_LOGS" | grep -q "allow_discards already active, skipping"; then
                   echo "[WARN] ${case_label}: reclaimed ${reclaimed} bytes but worker ${LAST_WORKER_JOB} reported allow_discards already active"
                 else
-                  echo "[FAIL] ${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
+                  echo "::error::${case_label}: reclaimed ${reclaimed} bytes (< ${min_reclaim_bytes})"
                   return 1
                 fi
               fi
             else
               if [[ "${post_trim}" -gt "${pre_trim}" ]]; then
-                echo "[FAIL] ${case_label}: post-trim size grew (${post_trim} > ${pre_trim})"
+                echo "::error::${case_label}: post-trim size grew (${post_trim} > ${pre_trim})"
                 return 1
               fi
             fi
@@ -1891,7 +1891,7 @@ jobs:
         run: |
           NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
           if [[ -z "${NODE_NAME}" ]]; then
-            echo "[FAIL] Could not determine Kubernetes node name"
+            echo "::error::Could not determine Kubernetes node name"
             exit 1
           fi
 
@@ -1929,7 +1929,7 @@ jobs:
           EOF
 
           if ! kubectl wait -n longhorn-system --for=jsonpath='{.status.phase}'=Succeeded pod/t4-uservol-probe --timeout=5m; then
-            echo "[FAIL] t4-uservol-probe pod did not complete successfully"
+            echo "::error::t4-uservol-probe pod did not complete successfully"
             kubectl -n longhorn-system describe pod t4-uservol-probe || true
             exit 1
           fi
@@ -1955,7 +1955,7 @@ jobs:
           done
 
           if [[ "${PATCH_OK}" -ne 1 ]]; then
-            echo "[FAIL] Could not patch Longhorn node disk config before timeout"
+            echo "::error::Could not patch Longhorn node disk config before timeout"
             kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o yaml || true
             exit 1
           fi
@@ -1974,7 +1974,7 @@ jobs:
           DISK_READY=$(kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o json \
             | jq -r '(.status.diskStatus["talos-uservol"].conditions[]? | select(.type == "Schedulable") | .status) // empty' | head -n1)
           if [[ "${DISK_READY}" != "true" && "${DISK_READY}" != "True" ]]; then
-            echo "[FAIL] Longhorn disk talos-uservol was not schedulable"
+            echo "::error::Longhorn disk talos-uservol was not schedulable"
             kubectl get nodes.longhorn.io "${NODE_NAME}" -n longhorn-system -o yaml
             exit 1
           fi
@@ -2030,7 +2030,7 @@ jobs:
             kubectl create job "${coord_job}" --from=cronjob/luks-trim -n luks-trim
 
             if ! kubectl wait -n luks-trim --for=condition=complete "job/${coord_job}" --timeout=5m; then
-              echo "[FAIL] Coordinator ${coord_job} did not complete"
+              echo "::error::Coordinator ${coord_job} did not complete"
               kubectl get "job/${coord_job}" -n luks-trim -o wide || true
               kubectl logs -n luks-trim -l "job-name=${coord_job}" --tail=-1 || true
               return 1
@@ -2051,13 +2051,13 @@ jobs:
             done
 
             if [[ -z "$worker_job" ]]; then
-              echo "[FAIL] No new worker job found for case ${case_label}"
+              echo "::error::No new worker job found for case ${case_label}"
               kubectl get jobs -n luks-trim -l "luks-trim/role=worker" -o wide || true
               return 1
             fi
 
             if ! kubectl wait -n luks-trim --for=condition=complete "job/${worker_job}" --timeout=5m; then
-              echo "[FAIL] Worker ${worker_job} did not complete"
+              echo "::error::Worker ${worker_job} did not complete"
               kubectl get "job/${worker_job}" -n luks-trim -o wide || true
               kubectl get pods -n luks-trim -l "job-name=${worker_job}" -o wide || true
               kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 || true
@@ -2067,25 +2067,25 @@ jobs:
             WORKER_LOGS=$(kubectl logs -n luks-trim -l "job-name=${worker_job}" --tail=-1 2>/dev/null)
             ERROR_COUNT=$(echo "$WORKER_LOGS" | grep -c '\[ERROR\]' || true)
             if [[ "$ERROR_COUNT" -gt 0 ]]; then
-              echo "[FAIL] Worker ${worker_job} emitted [ERROR] lines"
+              echo "::error::Worker ${worker_job} emitted [ERROR] lines"
               echo "$WORKER_LOGS" | grep '\[ERROR\]' || true
               return 1
             fi
 
             if ! echo "$WORKER_LOGS" | grep -q "Checking Talos LUKS volumes"; then
-              echo "[FAIL] Worker ${worker_job} did not run Talos volume path"
+              echo "::error::Worker ${worker_job} did not run Talos volume path"
               echo "$WORKER_LOGS"
               return 1
             fi
 
             if ! echo "$WORKER_LOGS" | grep -q "luks2-"; then
-              echo "[FAIL] Worker ${worker_job} did not discover any Talos /dev/mapper/luks2-* volumes"
+              echo "::error::Worker ${worker_job} did not discover any Talos /dev/mapper/luks2-* volumes"
               echo "$WORKER_LOGS"
               return 1
             fi
 
             if ! echo "$WORKER_LOGS" | grep -q "talos-static:\|allow_discards already active"; then
-              echo "[FAIL] Worker ${worker_job} did not log static-key Talos processing"
+              echo "::error::Worker ${worker_job} did not log static-key Talos processing"
               echo "$WORKER_LOGS"
               return 1
             fi
@@ -2099,7 +2099,7 @@ jobs:
             kubectl -n longhorn-system create job "${trigger_job}" --from=cronjob/"${cronjob_name}"
 
             if ! kubectl -n longhorn-system wait --for=condition=complete "job/${trigger_job}" --timeout=5m; then
-              echo "[FAIL] Longhorn trim job ${trigger_job} did not complete"
+              echo "::error::Longhorn trim job ${trigger_job} did not complete"
               kubectl -n longhorn-system get "job/${trigger_job}" -o wide || true
               kubectl -n longhorn-system logs -l "job-name=${trigger_job}" --tail=-1 || true
               return 1
@@ -2140,7 +2140,7 @@ jobs:
           EOF
 
           if ! kubectl wait pod/t4-talos-uservol-filler -n luks-trim-test --for=condition=Ready --timeout=5m; then
-            echo "[FAIL] t4-talos-uservol-filler did not become Ready within 5m"
+            echo "::error::t4-talos-uservol-filler did not become Ready within 5m"
             echo "[diagnostic] T4 pod state:"
             kubectl get pod t4-talos-uservol-filler -n luks-trim-test -o wide || true
             kubectl describe pod t4-talos-uservol-filler -n luks-trim-test || true
@@ -2167,7 +2167,7 @@ jobs:
 
           VOL_NAME=$(kubectl get pvc t4-talos-uservol-vol -n luks-trim-test -o jsonpath='{.spec.volumeName}')
           if [[ -z "${VOL_NAME}" ]]; then
-            echo "[FAIL] Could not resolve Longhorn volume name for T4 PVC"
+            echo "::error::Could not resolve Longhorn volume name for T4 PVC"
             exit 1
           fi
 
@@ -2177,13 +2177,13 @@ jobs:
           echo "[info] T4 replica disk path: ${REPLICA_DISK_PATH}"
 
           if [[ -z "${REPLICA_DISK_PATH}" ]]; then
-            echo "[FAIL] Could not find Longhorn replica for volume ${VOL_NAME}"
+            echo "::error::Could not find Longhorn replica for volume ${VOL_NAME}"
             kubectl get replicas.longhorn.io -n longhorn-system -o wide || true
             exit 1
           fi
 
           if [[ "${REPLICA_DISK_PATH}" != "${TALOS_USERVOLUME_LONGHORN_PATH}"* ]]; then
-            echo "[FAIL] Replica path ${REPLICA_DISK_PATH} is not on Talos uservolume path ${TALOS_USERVOLUME_LONGHORN_PATH}"
+            echo "::error::Replica path ${REPLICA_DISK_PATH} is not on Talos uservolume path ${TALOS_USERVOLUME_LONGHORN_PATH}"
             exit 1
           fi
 
@@ -2195,7 +2195,7 @@ jobs:
           SIZE_AFTER_WRITE=$(kubectl get volume.longhorn.io "${VOL_NAME}" -n longhorn-system -o jsonpath='{.status.actualSize}')
           WRITE_FLOOR=$(( 512 * 1024 * 1024 * 70 / 100 ))
           if [[ "${SIZE_AFTER_WRITE}" -lt "${WRITE_FLOOR}" ]]; then
-            echo "[FAIL] actualSize ${SIZE_AFTER_WRITE} is below floor ${WRITE_FLOOR} after write"
+            echo "::error::actualSize ${SIZE_AFTER_WRITE} is below floor ${WRITE_FLOOR} after write"
             exit 1
           fi
 
@@ -2215,7 +2215,7 @@ jobs:
 
           echo "[info] T4 pre-trim=${PRE_TRIM} post-trim=${POST_TRIM} reclaimed=${RECLAIMED}"
           if [[ "${RECLAIMED}" -lt "${MIN_RECLAIM}" ]]; then
-            echo "[FAIL] T4 reclaimed ${RECLAIMED} bytes (< ${MIN_RECLAIM})"
+            echo "::error::T4 reclaimed ${RECLAIMED} bytes (< ${MIN_RECLAIM})"
             exit 1
           fi
 
